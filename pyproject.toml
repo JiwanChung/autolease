@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autolease"
+version = "0.1.0"
+description = "Personal GPU pool manager for Slurm clusters"
+requires-python = ">=3.9"
+dependencies = ["pyyaml>=6.0", "textual>=0.40", "rich>=13.0"]
+
+[project.scripts]
+autolease = "autolease.cli:main"

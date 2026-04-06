@@ -1,0 +1,12 @@
+# autolease configuration
+# Copy to ~/.config/autolease/config.yaml
+ssh_host: your-cluster
+
+exclude_nodes: []
+
+# QoS GPU limits per user (0 or omitted = unlimited)
+# Only list QoS that have limits — unlisted ones default to unlimited.
+# Partitions, GPU types, and allowed QoS are auto-discovered from the cluster.
+qos:
+  base_qos: 8       # guaranteed, non-preemptible
+  # big_qos: 0      # unlimited, preemptible (default if omitted)
