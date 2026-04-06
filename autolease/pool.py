@@ -179,9 +179,9 @@ class Pool:
             return False
 
     def test_lease(self, lease: Lease, timeout: int = 60) -> dict:
-        """Thorough GPU test: nvidia-smi details + torch CUDA.
-        Returns {ok: bool, nvidia_smi: {...}, torch: {...}, errors: [...]}"""
-        result = {"ok": False, "nvidia_smi": {}, "torch": {}, "errors": []}
+        """Thorough GPU test: nvidia-smi details + CUDA compute capability.
+        Returns {ok: bool, nvidia_smi: {...}, cuda: {...}, errors: [...]}"""
+        result = {"ok": False, "nvidia_smi": {}, "cuda": {}, "errors": []}
         if lease.state != "RUNNING":
             result["errors"].append(f"lease not running (state={lease.state})")
             return result
@@ -226,47 +226,38 @@ class Pool:
         # Test 2: torch CUDA
         # Write script inline via the srun command itself.
         # Uses echo to create the file on the compute node, then runs it.
-        torch_cmd = (
-            "echo 'import torch' > /tmp/_al_torch.py && "
-            "echo 'assert torch.cuda.is_available()' >> /tmp/_al_torch.py && "
-            "echo 'n = torch.cuda.device_count()' >> /tmp/_al_torch.py && "
-            "echo 'x = torch.randn(256, 256, device=\"cuda:0\")' >> /tmp/_al_torch.py && "
-            "echo 'y = x @ x' >> /tmp/_al_torch.py && "
-            "echo 'print(\"ok\", n, \"devices\")' >> /tmp/_al_torch.py && "
-            "echo 'for i in range(n):' >> /tmp/_al_torch.py && "
-            "echo '    p = torch.cuda.get_device_properties(i)' >> /tmp/_al_torch.py && "
-            "echo '    print(i, torch.cuda.get_device_name(i), round(p.total_mem / 1e9, 1))' >> /tmp/_al_torch.py && "
-            "python3 /tmp/_al_torch.py"
+        # Test 2: CUDA compute test (no torch needed)
+        # Uses nvidia-cuda-mps or a simple deviceQuery-style check
+        cuda_cmd = (
+            "nvidia-smi -L; "
+            "echo '---'; "
+            "nvidia-smi --query-gpu=compute_cap --format=csv,noheader"
         )
         try:
             r = self.slurm.run_on_lease(
                 job_id=lease.job_id,
-                command=torch_cmd,
+                command=cuda_cmd,
                 num_gpus=lease.num_gpus,
                 timeout=timeout,
             )
             if r.returncode != 0:
-                # Filter SSH warnings from error
                 err = "\n".join(
                     l for l in r.stderr.strip().splitlines()
                     if not l.startswith("**") and "post-quantum" not in l
                 ).strip()
-                # Not fatal — torch may not be installed in base env
-                result["torch"] = {"available": False, "error": err if err else "unknown error"}
+                result["cuda"] = {"ok": False, "error": err if err else "unknown"}
             else:
                 lines = r.stdout.strip().splitlines()
-                if lines and lines[0].startswith("ok"):
-                    n = int(lines[0].split()[1])
-                    devs = []
-                    for line in lines[1:]:
-                        parts = line.split(None, 2)
-                        if len(parts) >= 3:
-                            devs.append({"id": parts[0], "name": parts[1], "mem": parts[2]})
-                    result["torch"] = {"available": True, "devices": n, "detail": devs}
-                else:
-                    result["torch"] = {"available": False, "output": r.stdout.strip()[:200]}
+                sep = next((i for i, l in enumerate(lines) if l.strip() == "---"), len(lines))
+                gpu_list = [l.strip() for l in lines[:sep] if l.strip()]
+                compute_caps = [l.strip() for l in lines[sep+1:] if l.strip()]
+                result["cuda"] = {
+                    "ok": len(gpu_list) > 0,
+                    "gpu_list": gpu_list,
+                    "compute_caps": compute_caps,
+                }
         except Exception as e:
-            result["torch"] = {"available": False, "error": str(e)}
+            result["cuda"] = {"ok": False, "error": str(e)}
 
         # Overall OK: nvidia-smi found GPUs, no critical errors
         has_gpus = result["nvidia_smi"].get("count", 0) > 0

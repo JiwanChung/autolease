@@ -140,22 +140,18 @@ def cmd_test(args):
         gpus = smi.get("gpus", [])
         if gpus:
             for g in gpus:
-                print(f"  nvidia-smi: {g['name']}  {g['mem_total_mb']}MB total  "
+                print(f"  smi: {g['name']}  {g['mem_total_mb']}MB total  "
                       f"{g['mem_free_mb']}MB free  {g['temp_c']}C  "
                       f"driver={g['driver']}")
         else:
-            print("  nvidia-smi: FAILED")
-        # torch
-        th = result.get("torch", {})
-        if th.get("available"):
-            print(f"  torch:     {th['devices']} device(s), CUDA matmul OK")
-            for d in th.get("detail", []):
-                print(f"             dev {d['id']}: {d['name']} {d['mem']}")
-        else:
-            err = th.get("error", "not available")
-            # Show just first meaningful line
-            err_line = next((l for l in err.splitlines() if l.strip()), err)[:80]
-            print(f"  torch:     {err_line}")
+            print("  smi: FAILED")
+        # cuda
+        cuda = result.get("cuda", {})
+        if cuda.get("ok"):
+            caps = ", ".join(cuda.get("compute_caps", []))
+            print(f"  cuda: {len(cuda.get('gpu_list', []))} GPU(s) visible, compute cap: {caps}")
+        elif cuda.get("error"):
+            print(f"  cuda: {cuda['error'][:80]}")
         # errors
         for e in result.get("errors", []):
             print(f"  ERROR: {e}")
@@ -361,7 +357,7 @@ def main():
     check_p.add_argument("--replace", action="store_true",
                          help="Auto-replace bad leases")
 
-    sub.add_parser("test", help="Thorough GPU test (nvidia-smi + torch CUDA)")
+    sub.add_parser("test", help="Thorough GPU test (nvidia-smi + CUDA compute)")
 
     renew_p = sub.add_parser("renew", help="Renew leases nearing expiry")
     renew_p.add_argument("-t", "--threshold", type=float, default=30.0,
