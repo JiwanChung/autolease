@@ -11,6 +11,7 @@ from typing import Optional
 
 from .slurm import Slurm, SlurmConfig, Lease
 from .config import PoolConfig, GPU_VRAM
+from .sync import sync as rsync_project, get_remote_dir
 
 
 @dataclass
@@ -23,6 +24,7 @@ class Job:
     min_vram: int = 0  # GB, 0 = any
     gpu_type: Optional[str] = None  # None = any
     priority: int = 0  # higher = more important
+    remote_cwd: Optional[str] = None  # remote dir to cd into before running
     exit_code: Optional[int] = None
     lease_job_id: Optional[int] = None
     remote_pid: Optional[int] = None
@@ -94,7 +96,8 @@ class JobQueue:
             return None
         with open(p) as f:
             d = json.load(f)
-        d.setdefault("priority", 0)  # backward compat
+        d.setdefault("priority", 0)
+        d.setdefault("remote_cwd", None)
         return Job(**d)
 
     def _all_jobs(self) -> list[Job]:
@@ -124,10 +127,11 @@ class JobQueue:
         srun = f"srun --jobid={lease.job_id} --gres=gpu:{job.num_gpus} --overlap"
 
         # Step 1: write the job script to remote
+        cd_prefix = f"cd {job.remote_cwd} && " if job.remote_cwd else ""
         setup = (
             f"mkdir -p {rdir} && "
             f"cat > {rdir}/run.sh << '__AUTOLEASE_SCRIPT__'\n"
-            f"{job.command}\n"
+            f"{cd_prefix}{job.command}\n"
             f"__AUTOLEASE_SCRIPT__\n"
             f"chmod +x {rdir}/run.sh"
         )
@@ -202,10 +206,24 @@ class JobQueue:
     def submit(self, command: str, project: Optional[str] = None,
                num_gpus: int = 1, min_vram: int = 0,
                gpu_type: Optional[str] = None,
-               priority: int = 0) -> Job:
-        """Submit a new job to the queue. Returns the job."""
+               priority: int = 0,
+               no_sync: bool = False) -> Job:
+        """Submit a new job to the queue. Auto-syncs code files first."""
         if project is None:
             project = _detect_project()
+
+        # Auto-sync code files to cluster
+        remote_cwd = None
+        if not no_sync:
+            try:
+                r = rsync_project(self.config)
+                if r.returncode == 0:
+                    remote_cwd = get_remote_dir(self.config)
+                else:
+                    self._log_event(f"SYNC_WARN job for {project}: rsync failed: {r.stderr.strip()[:100]}")
+            except Exception as e:
+                self._log_event(f"SYNC_WARN job for {project}: {e}")
+
         job = Job(
             id=self._next_id(),
             project=project,
@@ -215,10 +233,11 @@ class JobQueue:
             min_vram=min_vram,
             gpu_type=gpu_type,
             priority=priority,
+            remote_cwd=remote_cwd,
             submitted=_now(),
         )
         self._save_job(job)
-        self._log_event(f"SUBMIT job {job.id} project={project} priority={priority} gpus={num_gpus}")
+        self._log_event(f"SUBMIT job {job.id} project={project} priority={priority} gpus={num_gpus} cwd={remote_cwd}")
         self.dispatch()
         return job
 

@@ -214,6 +214,7 @@ def cmd_run(args):
         min_vram=args.min_vram,
         gpu_type=args.gpu_type,
         priority=args.priority,
+        no_sync=args.no_sync,
     )
     print(job.id)
 
@@ -298,6 +299,36 @@ def cmd_cancel(args):
 
 # ── Info commands ──
 
+def cmd_sync(args):
+    from .sync import sync as rsync_project, get_remote_dir
+    cfg = load_config(args.config)
+    remote = get_remote_dir(cfg)
+    print(f"Syncing code files -> {cfg.ssh_host}:{remote}/")
+    r = rsync_project(cfg, dry_run=args.dry_run, verbose=True)
+    if r.stdout:
+        print(r.stdout, end="")
+    if r.returncode != 0:
+        print(f"rsync failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+        sys.exit(1)
+    if args.dry_run:
+        print("(dry run — no files transferred)")
+    else:
+        print("Done.")
+
+
+def cmd_pull(args):
+    from .sync import pull as rsync_pull
+    cfg = load_config(args.config)
+    print(f"Pulling {args.path} from {cfg.ssh_host}...")
+    r = rsync_pull(cfg, args.path, verbose=True)
+    if r.stdout:
+        print(r.stdout, end="")
+    if r.returncode != 0:
+        print(f"rsync failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+        sys.exit(1)
+    print("Done.")
+
+
 def cmd_events(args):
     cfg = load_config(args.config)
     log_file = os.path.join(cfg.state_path, "events.log")
@@ -379,6 +410,8 @@ def main():
                        help="Minimum VRAM per GPU in GB (e.g. 48)")
     run_p.add_argument("-P", "--priority", type=int, default=0,
                        help="Job priority (higher preempts lower, default: 0)")
+    run_p.add_argument("--no-sync", action="store_true",
+                       help="Skip code sync before submitting")
     run_p.add_argument("command", nargs=argparse.REMAINDER, help="Command to run")
 
     status_p = sub.add_parser("status", help="Get job state (one word)")
@@ -403,6 +436,13 @@ def main():
 
     cancel_p = sub.add_parser("cancel", help="Cancel a queued or running job")
     cancel_p.add_argument("job_id", type=int, help="Job ID")
+
+    # Sync
+    sync_p = sub.add_parser("sync", help="Sync code files to cluster")
+    sync_p.add_argument("--dry-run", action="store_true", help="Show what would be synced")
+
+    pull_p = sub.add_parser("pull", help="Pull files from cluster")
+    pull_p.add_argument("path", help="Remote subpath to pull (e.g. results/)")
 
     # TUI
     sub.add_parser("tui", help="Interactive dashboard")
@@ -442,6 +482,8 @@ def main():
         "wait": cmd_wait,
         "cancel": cmd_cancel,
         "tui": lambda args: __import__('autolease.tui', fromlist=['run_tui']).run_tui(args.config),
+        "sync": cmd_sync,
+        "pull": cmd_pull,
         "events": cmd_events,
         "nodes": cmd_nodes,
         "partitions": cmd_partitions,
