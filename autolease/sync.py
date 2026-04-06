@@ -7,6 +7,24 @@ from typing import Optional
 
 from .config import PoolConfig
 
+
+def _newest_mtime(root: Path, include: list[str]) -> float:
+    """Find the newest mtime among code files in a directory."""
+    import fnmatch
+    newest = 0.0
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Skip excluded dirs
+        dirnames[:] = [d for d in dirnames if d not in (
+            "__pycache__", ".git", "node_modules", ".venv", "venv",
+            "wandb", ".eggs", ".ipynb_checkpoints",
+        ) and not d.endswith(".egg-info")]
+        for f in filenames:
+            if any(fnmatch.fnmatch(f, pat) for pat in include):
+                mt = os.path.getmtime(os.path.join(dirpath, f))
+                if mt > newest:
+                    newest = mt
+    return newest
+
 # Default: only sync code files
 DEFAULT_INCLUDE = [
     "*.py", "*.sh", "*.bash", "*.fish",
@@ -27,6 +45,7 @@ DEFAULT_EXCLUDE = [
     ".venv/", "venv/",
     "wandb/",
     ".ipynb_checkpoints/",
+    ".autolease_sync",
 ]
 
 def _detect_project_root() -> Path:
@@ -52,14 +71,45 @@ def _relative_to_home(path: Path) -> str:
         return f"projects/{path.name}"
 
 
+def needs_sync(local_dir: Optional[str] = None,
+               include: Optional[list[str]] = None) -> bool:
+    """Check if any code file has been modified since last sync."""
+    project_root = Path(local_dir) if local_dir else _detect_project_root()
+    stamp_file = project_root / ".autolease_sync"
+    inc = include or DEFAULT_INCLUDE
+
+    newest = _newest_mtime(project_root, inc)
+    if newest == 0.0:
+        return False  # no code files at all
+
+    if stamp_file.exists():
+        last_sync = stamp_file.stat().st_mtime
+        if newest <= last_sync:
+            return False  # nothing changed since last sync
+
+    return True
+
+
+def _touch_stamp(local_dir: Optional[str] = None):
+    """Update the sync timestamp."""
+    project_root = Path(local_dir) if local_dir else _detect_project_root()
+    stamp_file = project_root / ".autolease_sync"
+    stamp_file.touch()
+
+
 def sync(config: PoolConfig,
          local_dir: Optional[str] = None,
          dry_run: bool = False,
          include: Optional[list[str]] = None,
          exclude: Optional[list[str]] = None,
-         verbose: bool = False) -> subprocess.CompletedProcess:
+         verbose: bool = False,
+         force: bool = False) -> Optional[subprocess.CompletedProcess]:
     """Rsync code files from local project to cluster.
-    Remote path mirrors local path relative to ~."""
+    Skips if no code files changed since last sync (unless force=True).
+    Returns None if skipped, CompletedProcess otherwise."""
+    if not force and not dry_run and not needs_sync(local_dir, include):
+        return None  # nothing changed
+
     project_root = Path(local_dir) if local_dir else _detect_project_root()
     rel_path = _relative_to_home(project_root)
     remote_dir = f"~/{rel_path}/"
@@ -94,7 +144,10 @@ def sync(config: PoolConfig,
 
     cmd.extend([src, dst])
 
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode == 0 and not dry_run:
+        _touch_stamp(local_dir)
+    return result
 
 
 def get_remote_dir(config: PoolConfig, local_dir: Optional[str] = None) -> str:

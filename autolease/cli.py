@@ -305,7 +305,7 @@ def cmd_sync(args):
     cfg = load_config(args.config)
     remote = get_remote_dir(cfg)
     print(f"Syncing code files -> {cfg.ssh_host}:{remote}/")
-    r = rsync_project(cfg, dry_run=args.dry_run, verbose=True)
+    r = rsync_project(cfg, dry_run=args.dry_run, verbose=True, force=True)
     if r.stdout:
         print(r.stdout, end="")
     if r.returncode != 0:

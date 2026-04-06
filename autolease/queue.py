@@ -229,9 +229,8 @@ class JobQueue:
         if not no_sync:
             try:
                 r = rsync_project(self.config)
-                if r.returncode == 0:
-                    remote_cwd = get_remote_dir(self.config)
-                else:
+                remote_cwd = get_remote_dir(self.config)
+                if r is not None and r.returncode != 0:
                     self._log_event(f"SYNC_WARN job for {project}: rsync failed: {r.stderr.strip()[:100]}")
             except Exception as e:
                 self._log_event(f"SYNC_WARN job for {project}: {e}")
