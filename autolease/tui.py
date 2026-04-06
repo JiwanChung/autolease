@@ -275,9 +275,7 @@ class AutoleaseApp(App):
         self._queue = JobQueue(self._config)
         self._refresh_timer: Timer | None = None
         self._known_leases: dict[int, str] = {}
-        # Discover cluster partitions if not already populated
-        if not PARTITION_INFO:
-            discover_partitions(self._pool.slurm)
+        self._discovered = False
         apply_qos_config(self._config)
 
     def compose(self) -> ComposeResult:
@@ -310,6 +308,9 @@ class AutoleaseApp(App):
 
     def _refresh_in_thread(self) -> None:
         try:
+            if not self._discovered:
+                discover_partitions(self._pool.slurm)
+                self._discovered = True
             leases = self._pool.status()
             jobs = self._queue.list_jobs()
             bad = self._pool.bad_nodes()

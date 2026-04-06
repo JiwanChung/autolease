@@ -33,14 +33,14 @@ class Pool:
 
     def _load_state(self) -> dict:
         if not os.path.exists(self._state_file):
-            return {"leases": [], "bad_nodes": []}
+            return {"leases": [], "bad_nodes": [], "cancelled": []}
         with open(self._state_file) as f:
             data = json.load(f)
-        # Migrate old format
         if isinstance(data, dict) and "leases" in data:
             data.setdefault("bad_nodes", [])
+            data.setdefault("cancelled", [])
             return data
-        return {"leases": [], "bad_nodes": []}
+        return {"leases": [], "bad_nodes": [], "cancelled": []}
 
     def _save_state(self, leases: list[Lease], bad_nodes: Optional[list[str]] = None):
         self._ensure_state_dir()
@@ -121,36 +121,82 @@ class Pool:
         except RuntimeError:
             return None
 
+    def _get_cancelled(self) -> set[int]:
+        state = self._load_state()
+        return set(state.get("cancelled", []))
+
+    def _add_cancelled(self, job_ids: list[int]):
+        state = self._load_state()
+        cancelled = set(state.get("cancelled", []))
+        cancelled.update(job_ids)
+        state["cancelled"] = list(cancelled)
+        tmp = self._state_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, self._state_file)
+
     def release(self, job_id: int):
         """Cancel and remove a single lease."""
         self.slurm.cancel_job(job_id)
         leases = [l for l in self._get_leases() if l.job_id != job_id]
         self._save_state(leases)
+        self._add_cancelled([job_id])
 
     def down(self):
         """Cancel all held leases."""
         leases = self._get_leases()
+        ids = []
         for lease in leases:
             try:
                 self.slurm.cancel_job(lease.job_id)
+                ids.append(lease.job_id)
             except RuntimeError:
-                pass  # already gone
+                pass
         self._save_state([])
+        self._add_cancelled(ids)
         return len(leases)
 
     def refresh(self) -> list[Lease]:
-        """Refresh lease states from Slurm. Adopt orphaned autolease jobs.
-        Remove dead ones. Sets self.lost_leases for callers to check."""
+        """Refresh lease states from Slurm in a single squeue call.
+        Adopts orphaned autolease jobs. Sets self.lost_leases."""
         from .config import PARTITION_INFO
-        leases = self._get_leases()
-        known_ids = {l.job_id for l in leases}
-        alive = []
+        old_leases = {l.job_id: l for l in self._get_leases()}
         self.lost_leases = []
 
-        # Adopt orphaned autolease jobs from squeue
-        for sj in self.slurm.my_jobs("autolease"):
-            if sj["job_id"] not in known_ids:
-                # Parse gpu count from gres (e.g. "gpu:4" or "gpu:RTX3090:4")
+        # Single SSH call: get all autolease jobs from squeue
+        cancelled = self._get_cancelled()
+        all_squeue = self.slurm.my_jobs("autolease")
+        slurm_jobs = {sj["job_id"]: sj for sj in all_squeue if sj["job_id"] not in cancelled}
+
+        # Clean cancelled IDs that have left squeue
+        squeue_ids = {sj["job_id"] for sj in all_squeue}
+        remaining = cancelled & squeue_ids
+        if remaining != cancelled:
+            state = self._load_state()
+            state["cancelled"] = list(remaining)
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, self._state_file)
+
+        # Detect lost leases (were running, no longer in squeue)
+        for jid, old in old_leases.items():
+            if jid not in slurm_jobs and old.state == "RUNNING":
+                self.lost_leases.append(old)
+
+        # Build alive list from squeue (source of truth)
+        alive = []
+        for jid, sj in slurm_jobs.items():
+            if jid in old_leases:
+                # Known lease — update state
+                lease = old_leases[jid]
+                lease.state = sj["state"]
+                lease.node = sj["node"]
+                lease.end_time = sj.get("end_time")
+                lease.time_limit = sj.get("timelimit") or lease.time_limit
+                lease.qos = sj.get("qos") or lease.qos
+            else:
+                # Orphan — adopt it
                 gres = sj.get("gres", "")
                 num_gpus = 1
                 if gres:
@@ -158,46 +204,21 @@ class Pool:
                         num_gpus = int(gres.split(":")[-1])
                     except ValueError:
                         pass
-                # Determine GPU type from partition info
                 pinfo = PARTITION_INFO.get(sj["partition"])
                 gpu_type = pinfo[1] if pinfo else "unknown"
-                # Determine QoS from job info
-                info = self.slurm.job_info(sj["job_id"])
-                qos = ""
-                if info.get("state") != "GONE":
-                    # Parse QoS from scontrol output
-                    r = self.slurm.cfg.run(
-                        f"scontrol show job {sj['job_id']} --oneliner 2>/dev/null"
-                    )
-                    if r.returncode == 0:
-                        for token in r.stdout.strip().split():
-                            if token.startswith("QOS="):
-                                qos = token.split("=", 1)[1]
-                                break
-                leases.append(Lease(
-                    job_id=sj["job_id"],
+                lease = Lease(
+                    job_id=jid,
                     partition=sj["partition"],
-                    qos=qos,
+                    qos=sj.get("qos", ""),
                     gpu_type=gpu_type,
                     num_gpus=num_gpus,
-                    node=sj.get("node") or None,
+                    node=sj["node"],
                     state=sj["state"],
-                ))
-                known_ids.add(sj["job_id"])
-
-        # Now refresh all leases from Slurm
-        for lease in leases:
-            info = self.slurm.job_info(lease.job_id)
-            state = info.get("state", "GONE")
-            if state in ("COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "GONE", "UNKNOWN"):
-                if lease.state == "RUNNING":
-                    self.lost_leases.append(lease)
-                continue
-            lease.state = state
-            lease.node = info.get("node")
-            lease.end_time = info.get("end_time")
-            lease.time_limit = info.get("time_limit") or lease.time_limit
+                    end_time=sj.get("end_time"),
+                    time_limit=sj.get("timelimit"),
+                )
             alive.append(lease)
+
         self._save_state(alive)
         return alive
 

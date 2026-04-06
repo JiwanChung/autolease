@@ -294,26 +294,29 @@ class Slurm:
         return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
 
     def my_jobs(self, name_prefix: str = "autolease") -> list[dict]:
-        """List the user's current jobs matching a name prefix."""
+        """List the user's current jobs matching a name prefix.
+        Single SSH call, returns all needed fields."""
         r = self.cfg.run(
-            f'squeue -u $(whoami) -o "%i|%j|%P|%T|%N|%b|%l" --noheader'
+            f'squeue -u $(whoami) -o "%i|%j|%P|%T|%N|%b|%l|%q|%e" --noheader'
         )
         if r.returncode != 0:
             return []
         jobs = []
         for line in r.stdout.strip().splitlines():
             parts = line.strip().split("|")
-            if len(parts) < 7:
+            if len(parts) < 9:
                 continue
-            jid, name, part, state, node, gres, timelim = parts[:7]
+            jid, name, part, state, node, gres, timelim, qos, end_time = parts[:9]
             if name.startswith(name_prefix):
                 jobs.append({
                     "job_id": int(jid),
                     "name": name,
                     "partition": part,
                     "state": state,
-                    "node": node,
+                    "node": node if node else None,
                     "gres": gres,
                     "timelimit": timelim,
+                    "qos": qos,
+                    "end_time": end_time if end_time != "N/A" else None,
                 })
         return jobs
