@@ -298,7 +298,7 @@ class AutoleaseApp(App):
 
     def on_mount(self) -> None:
         self._do_refresh()
-        self._refresh_timer = self.set_interval(5.0, self._do_refresh)
+        self._refresh_timer = self.set_interval(30.0, self._do_refresh)
 
     # ── Refresh ──
 
@@ -311,8 +311,10 @@ class AutoleaseApp(App):
             if not self._discovered:
                 discover_partitions(self._pool.slurm)
                 self._discovered = True
+            # Single squeue call for leases
             leases = self._pool.status()
-            jobs = self._queue.list_jobs()
+            # Read jobs from local state only — no SSH, no dispatch
+            jobs = self._queue._all_jobs()
             bad = self._pool.bad_nodes()
             self.call_from_thread(self._apply_refresh, leases, jobs, bad)
         except Exception:

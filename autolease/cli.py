@@ -459,16 +459,20 @@ def main():
 
     args = p.parse_args()
 
-    # Load config + discover cluster
+    # Load config (local only — no SSH)
     cfg = load_config(args.config)
-    from .slurm import Slurm, SlurmConfig
-    discover_partitions(Slurm(SlurmConfig(ssh_host=cfg.ssh_host, shell=cfg.shell)))
     apply_qos_config(cfg)
 
     if args.cmd is None:
         from .tui import run_tui
         run_tui(args.config)
         return
+
+    # Only discover partitions for commands that need it
+    needs_discovery = {"up", "partitions", "nodes", "pool", "check", "test", "run"}
+    if args.cmd in needs_discovery:
+        from .slurm import Slurm, SlurmConfig
+        discover_partitions(Slurm(SlurmConfig(ssh_host=cfg.ssh_host, shell=cfg.shell)))
 
     cmds = {
         "up": cmd_up,
