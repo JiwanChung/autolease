@@ -26,12 +26,16 @@ autolease solves this by maintaining a personal pool of held GPU allocations and
 ## Install
 
 ```bash
-pip install -e .
+# With uv (recommended)
+uv tool install git+https://github.com/JiwanChung/autolease
+
+# Or from a local clone
+git clone https://github.com/JiwanChung/autolease
+cd autolease
+uv tool install -e .
 ```
 
 Requires Python 3.9+ and SSH access to the cluster. The cluster needs Slurm 23.11+.
-
-Dependencies: `pyyaml`, `textual`, `rich`.
 
 ## Quick start
 

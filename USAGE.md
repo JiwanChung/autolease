@@ -7,7 +7,7 @@ This document describes how a coding agent (e.g. Claude Code) should use autolea
 autolease must be installed on the local machine (not the cluster). It communicates with the cluster via SSH.
 
 ```bash
-pip install -e /path/to/autolease
+uv tool install git+https://github.com/JiwanChung/autolease
 ```
 
 Config is at `~/.config/autolease/config.yaml`. The only required field is `ssh_host`.
