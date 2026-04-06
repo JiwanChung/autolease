@@ -164,7 +164,7 @@ class Pool:
         return self.refresh()
 
     def check_lease(self, lease: Lease, timeout: int = 15) -> bool:
-        """Health-check a running lease by running nvidia-smi on it."""
+        """Quick health-check a running lease (nvidia-smi only)."""
         if lease.state != "RUNNING":
             return False
         try:
@@ -177,6 +177,101 @@ class Pool:
             return r.returncode == 0 and r.stdout.strip() != ""
         except Exception:
             return False
+
+    def test_lease(self, lease: Lease, timeout: int = 60) -> dict:
+        """Thorough GPU test: nvidia-smi details + torch CUDA.
+        Returns {ok: bool, nvidia_smi: {...}, torch: {...}, errors: [...]}"""
+        result = {"ok": False, "nvidia_smi": {}, "torch": {}, "errors": []}
+        if lease.state != "RUNNING":
+            result["errors"].append(f"lease not running (state={lease.state})")
+            return result
+
+        # Test 1: nvidia-smi
+        try:
+            r = self.slurm.run_on_lease(
+                job_id=lease.job_id,
+                command=(
+                    "nvidia-smi --query-gpu=name,memory.total,memory.free,"
+                    "driver_version,temperature.gpu,utilization.gpu"
+                    " --format=csv,noheader,nounits"
+                ),
+                num_gpus=lease.num_gpus,
+                timeout=timeout,
+            )
+            if r.returncode != 0:
+                # Filter SSH warnings from error
+                err = "\n".join(
+                    l for l in r.stderr.strip().splitlines()
+                    if not l.startswith("**")
+                )
+                result["errors"].append(f"nvidia-smi failed: {err[:200]}" if err else
+                                        f"nvidia-smi failed (rc={r.returncode}): {r.stdout.strip()[:200]}")
+            else:
+                gpus = []
+                for line in r.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 6:
+                        gpus.append({
+                            "name": parts[0],
+                            "mem_total_mb": parts[1],
+                            "mem_free_mb": parts[2],
+                            "driver": parts[3],
+                            "temp_c": parts[4],
+                            "util_pct": parts[5],
+                        })
+                result["nvidia_smi"] = {"gpus": gpus, "count": len(gpus)}
+        except Exception as e:
+            result["errors"].append(f"nvidia-smi exception: {e}")
+
+        # Test 2: torch CUDA
+        # Write script inline via the srun command itself.
+        # Uses echo to create the file on the compute node, then runs it.
+        torch_cmd = (
+            "echo 'import torch' > /tmp/_al_torch.py && "
+            "echo 'assert torch.cuda.is_available()' >> /tmp/_al_torch.py && "
+            "echo 'n = torch.cuda.device_count()' >> /tmp/_al_torch.py && "
+            "echo 'x = torch.randn(256, 256, device=\"cuda:0\")' >> /tmp/_al_torch.py && "
+            "echo 'y = x @ x' >> /tmp/_al_torch.py && "
+            "echo 'print(\"ok\", n, \"devices\")' >> /tmp/_al_torch.py && "
+            "echo 'for i in range(n):' >> /tmp/_al_torch.py && "
+            "echo '    p = torch.cuda.get_device_properties(i)' >> /tmp/_al_torch.py && "
+            "echo '    print(i, torch.cuda.get_device_name(i), round(p.total_mem / 1e9, 1))' >> /tmp/_al_torch.py && "
+            "python3 /tmp/_al_torch.py"
+        )
+        try:
+            r = self.slurm.run_on_lease(
+                job_id=lease.job_id,
+                command=torch_cmd,
+                num_gpus=lease.num_gpus,
+                timeout=timeout,
+            )
+            if r.returncode != 0:
+                # Filter SSH warnings from error
+                err = "\n".join(
+                    l for l in r.stderr.strip().splitlines()
+                    if not l.startswith("**") and "post-quantum" not in l
+                ).strip()
+                # Not fatal — torch may not be installed in base env
+                result["torch"] = {"available": False, "error": err if err else "unknown error"}
+            else:
+                lines = r.stdout.strip().splitlines()
+                if lines and lines[0].startswith("ok"):
+                    n = int(lines[0].split()[1])
+                    devs = []
+                    for line in lines[1:]:
+                        parts = line.split(None, 2)
+                        if len(parts) >= 3:
+                            devs.append({"id": parts[0], "name": parts[1], "mem": parts[2]})
+                    result["torch"] = {"available": True, "devices": n, "detail": devs}
+                else:
+                    result["torch"] = {"available": False, "output": r.stdout.strip()[:200]}
+        except Exception as e:
+            result["torch"] = {"available": False, "error": str(e)}
+
+        # Overall OK: nvidia-smi found GPUs, no critical errors
+        has_gpus = result["nvidia_smi"].get("count", 0) > 0
+        result["ok"] = has_gpus and not result["errors"]
+        return result
 
     def wait_and_check(self, lease: Lease, poll_interval: int = 5,
                        max_wait: int = 120) -> bool:

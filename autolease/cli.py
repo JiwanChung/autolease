@@ -123,6 +123,46 @@ def cmd_check(args):
         print(f"\nBad nodes: {', '.join(bad)}")
 
 
+def cmd_test(args):
+    pool = Pool(load_config(args.config))
+    leases = pool.status()
+    if not leases:
+        print("No active leases to test.")
+        return
+    for l in leases:
+        if l.state != "RUNNING":
+            print(f"lease {l.job_id} ({l.partition}): {l.state} — skipped")
+            continue
+        print(f"lease {l.job_id} on {l.node} ({l.gpu_type} x{l.num_gpus}):")
+        result = pool.test_lease(l)
+        # nvidia-smi
+        smi = result.get("nvidia_smi", {})
+        gpus = smi.get("gpus", [])
+        if gpus:
+            for g in gpus:
+                print(f"  nvidia-smi: {g['name']}  {g['mem_total_mb']}MB total  "
+                      f"{g['mem_free_mb']}MB free  {g['temp_c']}C  "
+                      f"driver={g['driver']}")
+        else:
+            print("  nvidia-smi: FAILED")
+        # torch
+        th = result.get("torch", {})
+        if th.get("available"):
+            print(f"  torch:     {th['devices']} device(s), CUDA matmul OK")
+            for d in th.get("detail", []):
+                print(f"             dev {d['id']}: {d['name']} {d['mem']}")
+        else:
+            err = th.get("error", "not available")
+            # Show just first meaningful line
+            err_line = next((l for l in err.splitlines() if l.strip()), err)[:80]
+            print(f"  torch:     {err_line}")
+        # errors
+        for e in result.get("errors", []):
+            print(f"  ERROR: {e}")
+        print(f"  -> {'PASS' if result['ok'] else 'FAIL'}")
+        print()
+
+
 def cmd_renew(args):
     pool = Pool(load_config(args.config))
     print(f"Checking leases (threshold: {args.threshold}min)...")
@@ -317,9 +357,11 @@ def main():
     sub.add_parser("down", help="Release all leases")
     sub.add_parser("pool", help="Show lease status with remaining time")
 
-    check_p = sub.add_parser("check", help="Health-check running leases")
+    check_p = sub.add_parser("check", help="Quick health-check running leases")
     check_p.add_argument("--replace", action="store_true",
                          help="Auto-replace bad leases")
+
+    sub.add_parser("test", help="Thorough GPU test (nvidia-smi + torch CUDA)")
 
     renew_p = sub.add_parser("renew", help="Renew leases nearing expiry")
     renew_p.add_argument("-t", "--threshold", type=float, default=30.0,
@@ -394,6 +436,7 @@ def main():
         "down": cmd_down,
         "pool": cmd_pool_status,
         "check": cmd_check,
+        "test": cmd_test,
         "renew": cmd_renew,
         "bad-nodes": cmd_bad_nodes,
         "run": cmd_run,
