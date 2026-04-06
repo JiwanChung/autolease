@@ -19,9 +19,10 @@ autolease solves this by maintaining a personal pool of held GPU allocations and
 
 1. **Leases** are persistent `sbatch sleep` jobs that hold GPUs. You acquire them with `autolease up <partition>`.
 2. **Jobs** are submitted to leases via `srun --jobid --overlap`. They're async by default and queued across projects with round-robin fairness.
-3. **Health checks** run `nvidia-smi` on each lease. Bad nodes are auto-excluded.
-4. **QoS auto-selection** fills guaranteed slots first (`base_qos`), then overflows to preemptible (`big_qos`).
-5. **Preemption detection** notifies you when a lease disappears unexpectedly.
+3. **Priority & preemption**: higher-priority jobs (`-P 10`) preempt lower-priority running jobs. Preempted jobs are re-queued, not killed. Jobs prefer the smallest GPU that fits.
+4. **Health checks** run `nvidia-smi` on each lease. Bad nodes are auto-excluded.
+5. **QoS auto-selection** fills guaranteed slots first (`base_qos`), then overflows to preemptible (`big_qos`).
+6. **Preemption detection** notifies you when a lease disappears unexpectedly.
 
 ## Install
 
@@ -64,6 +65,7 @@ Config lives at `~/.config/autolease/config.yaml`:
 
 ```yaml
 ssh_host: your-cluster
+shell: fish          # remote shell (bash, fish, zsh)
 
 exclude_nodes:
   - bad-node-01
@@ -75,6 +77,8 @@ qos:
 ```
 
 That's it. Partitions, GPU types, and allowed QoS lists are auto-discovered from the cluster via `scontrol`. VRAM is a built-in lookup table. You only need to declare QoS limits that affect your strategy.
+
+The `shell` setting controls which shell runs your commands on GPU nodes. Set it to match whatever shell has your conda/micromamba/module setup.
 
 State and job data are stored in `~/.local/share/autolease/`.
 
@@ -108,6 +112,13 @@ State and job data are stored in `~/.local/share/autolease/`.
 - `-g, --gpu-type` Require exact GPU type (e.g. `A6000`)
 - `-n, --num-gpus` Number of GPUs (default: 1)
 - `--min-vram` Minimum VRAM per GPU in GB (e.g. `48`)
+- `-P, --priority` Job priority (default: 0). Higher priority jobs preempt lower ones.
+
+### Events
+
+| Command | Description |
+|---|---|
+| `autolease events [-n N]` | Show last N dispatch/preemption events (default: 20) |
 
 ### Info
 
@@ -165,7 +176,8 @@ autolease/
 - **Leases** are `sbatch --wrap 'sleep infinity'` jobs. Work runs inside them via `srun --jobid --overlap`.
 - **Jobs** execute on the remote via `nohup srun ... &`, surviving SSH disconnects. Output is written to `~/.autolease/jobs/<id>/` on the cluster.
 - **State** is local JSON files. No database, no daemon.
-- **Dispatch** is opportunistic: every CLI call that touches the queue also dispatches pending jobs to free lease slots.
+- **Dispatch** is opportunistic: every CLI call that touches the queue also dispatches pending jobs to free lease slots. Jobs prefer the smallest VRAM lease that fits their requirements.
+- **Priority preemption**: when a high-priority job has no free lease, it preempts the lowest-priority running job on a matching lease. The victim is re-queued. All events are logged to `events.log`.
 
 ## License
 

@@ -54,7 +54,21 @@ id=$(autolease run --min-vram 48 -- python big_model.py)
 id=$(autolease run -g a100 -- python train.py)
 ```
 
-If no matching lease is available, the job stays queued until one becomes free.
+If no matching lease is available, the job stays queued until one becomes free. Jobs without specific GPU requirements are dispatched to the smallest available GPU first, keeping large GPUs free for jobs that need them.
+
+### Priority
+
+Jobs have a priority (default 0). Higher-priority jobs preempt lower-priority running jobs if no free lease is available. Preempted jobs are re-queued, not lost.
+
+```bash
+# Normal training (default priority 0)
+id=$(autolease run -- python train.py)
+
+# Urgent debug run (priority 10) — will preempt a priority-0 job if needed
+id=$(autolease run -P 10 -- python debug.py)
+```
+
+Use higher priority for interactive debugging. Use default (0) for batch training. All preemption events are logged to `autolease events`.
 
 ### Project isolation
 
@@ -111,17 +125,18 @@ autolease cancel $id
 
 ```bash
 # Write code, test on GPU, read output, iterate
-id=$(autolease run -- python test_forward.py)
+# Use -P 10 so debug runs preempt background training if needed
+id=$(autolease run -P 10 -- python test_forward.py)
 autolease wait $id
 # ... read output, fix code ...
-id=$(autolease run -- python test_forward.py)
+id=$(autolease run -P 10 -- python test_forward.py)
 autolease wait $id
 ```
 
 ### Fire and check later
 
 ```bash
-# Kick off training
+# Kick off training (default priority — can be preempted by debug runs)
 id=$(autolease run -- python train.py --epochs 50)
 # ... do other work ...
 autolease status $id        # check progress
@@ -159,11 +174,28 @@ done
 autolease jobs sweep -a   # watch progress
 ```
 
+## Events
+
+View dispatch and preemption history:
+
+```bash
+autolease events         # last 20 events
+autolease events -n 50   # last 50 events
+```
+
+Example output:
+```
+[2026-04-06T15:30:01] SUBMIT job 8 project=diffusion-lm priority=10 gpus=1
+[2026-04-06T15:30:01] PREEMPT job 5 (priority=0, project=sweep) on node15 — re-queued
+[2026-04-06T15:30:02] DISPATCH job 8 (priority=10) -> node15 (RTX3090) [preempted job 5]
+```
+
 ## Error handling
 
 - If `autolease run` returns a job ID but `status` shows `queued` for a long time, there may be no matching lease. Check `autolease pool` and acquire one if needed.
 - If `status` shows `failed`, check `autolease log $id --stderr` for details.
 - If a lease was preempted, `autolease pool` will report it. Acquire a new one.
+- If a job was preempted by a higher-priority job, it goes back to `queued` and will re-dispatch when a slot opens.
 
 ## Reference: exit codes
 
