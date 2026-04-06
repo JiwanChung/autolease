@@ -139,11 +139,53 @@ class Pool:
         return len(leases)
 
     def refresh(self) -> list[Lease]:
-        """Refresh lease states from Slurm. Remove dead ones.
-        Returns (alive_leases). Sets self.lost_leases for callers to check."""
+        """Refresh lease states from Slurm. Adopt orphaned autolease jobs.
+        Remove dead ones. Sets self.lost_leases for callers to check."""
+        from .config import PARTITION_INFO
         leases = self._get_leases()
+        known_ids = {l.job_id for l in leases}
         alive = []
         self.lost_leases = []
+
+        # Adopt orphaned autolease jobs from squeue
+        for sj in self.slurm.my_jobs("autolease"):
+            if sj["job_id"] not in known_ids:
+                # Parse gpu count from gres (e.g. "gpu:4" or "gpu:RTX3090:4")
+                gres = sj.get("gres", "")
+                num_gpus = 1
+                if gres:
+                    try:
+                        num_gpus = int(gres.split(":")[-1])
+                    except ValueError:
+                        pass
+                # Determine GPU type from partition info
+                pinfo = PARTITION_INFO.get(sj["partition"])
+                gpu_type = pinfo[1] if pinfo else "unknown"
+                # Determine QoS from job info
+                info = self.slurm.job_info(sj["job_id"])
+                qos = ""
+                if info.get("state") != "GONE":
+                    # Parse QoS from scontrol output
+                    r = self.slurm.cfg.run(
+                        f"scontrol show job {sj['job_id']} --oneliner 2>/dev/null"
+                    )
+                    if r.returncode == 0:
+                        for token in r.stdout.strip().split():
+                            if token.startswith("QOS="):
+                                qos = token.split("=", 1)[1]
+                                break
+                leases.append(Lease(
+                    job_id=sj["job_id"],
+                    partition=sj["partition"],
+                    qos=qos,
+                    gpu_type=gpu_type,
+                    num_gpus=num_gpus,
+                    node=sj.get("node") or None,
+                    state=sj["state"],
+                ))
+                known_ids.add(sj["job_id"])
+
+        # Now refresh all leases from Slurm
         for lease in leases:
             info = self.slurm.job_info(lease.job_id)
             state = info.get("state", "GONE")
