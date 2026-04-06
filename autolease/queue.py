@@ -203,14 +203,26 @@ class JobQueue:
 
     # ── Queue operations ──
 
+    def _wrap_with_env(self, command: str, env: Optional[str] = None) -> str:
+        """Wrap command with env activation if configured."""
+        env_name = env or self.config.env
+        if not env_name:
+            return command
+        activate = self.config.env_activate.replace("{env}", env_name)
+        return f"{activate} {command}"
+
     def submit(self, command: str, project: Optional[str] = None,
                num_gpus: int = 1, min_vram: int = 0,
                gpu_type: Optional[str] = None,
                priority: int = 0,
+               env: Optional[str] = None,
                no_sync: bool = False) -> Job:
         """Submit a new job to the queue. Auto-syncs code files first."""
         if project is None:
             project = _detect_project()
+
+        # Wrap command with env activation
+        wrapped_command = self._wrap_with_env(command, env)
 
         # Auto-sync code files to cluster
         remote_cwd = None
@@ -227,7 +239,7 @@ class JobQueue:
         job = Job(
             id=self._next_id(),
             project=project,
-            command=command,
+            command=wrapped_command,
             state="queued",
             num_gpus=num_gpus,
             min_vram=min_vram,

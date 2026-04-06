@@ -63,6 +63,8 @@ class LeaseSpec:
 class PoolConfig:
     ssh_host: str = "localhost"
     shell: str = "bash"  # remote shell for job execution (bash, fish, zsh)
+    env: str = ""  # default conda/micromamba env for jobs
+    env_activate: str = "micromamba run -n {env}"  # command template, {env} replaced
     exclude_nodes: list[str] = field(default_factory=list)
     state_dir: str = ""
     qos_rules: dict[str, QoSRule] = field(default_factory=dict)
@@ -171,6 +173,8 @@ def load_config(path: Optional[str] = None) -> PoolConfig:
     return PoolConfig(
         ssh_host=raw.get("ssh_host", "localhost"),
         shell=raw.get("shell", "bash"),
+        env=raw.get("env", ""),
+        env_activate=raw.get("env_activate", "micromamba run -n {env}"),
         exclude_nodes=raw.get("exclude_nodes", []),
         state_dir=raw.get("state_dir", str(_data_dir())),
         qos_rules=qos_rules,

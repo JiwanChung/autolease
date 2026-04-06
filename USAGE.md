@@ -1,6 +1,6 @@
 # autolease usage for coding agents
 
-This document describes how a coding agent (e.g. Claude Code) should use autolease to run GPU workloads on the Slurm cluster.
+This document describes how a coding agent (e.g. Claude Code) should use autolease to run GPU workloads on a Slurm cluster.
 
 ## Setup
 
@@ -10,7 +10,7 @@ autolease must be installed on the local machine (not the cluster). It communica
 uv tool install git+https://github.com/JiwanChung/autolease
 ```
 
-Config is at `~/.config/autolease/config.yaml`. The only required field is `ssh_host`.
+Config is at `~/.config/autolease/config.yaml`. Required fields: `ssh_host`. Recommended: `shell`, `env`, `env_activate`.
 
 ## Before running jobs: ensure leases exist
 
@@ -35,11 +35,13 @@ QoS is auto-selected. Time defaults to partition max. No other config needed.
 
 ## Submitting jobs
 
-Every `run` is async. It returns a bare job ID on stdout.
+Every `run` is async. It returns a bare job ID on stdout. Code files are auto-synced to the cluster before dispatch. The configured conda/micromamba env is auto-activated.
 
 ```bash
 id=$(autolease run -- python train.py --lr 0.001)
 ```
+
+The command runs in the synced project directory on the cluster, with the configured env active. You don't need to `cd`, `rsync`, or `conda activate` manually.
 
 ### Resource requirements
 
@@ -68,7 +70,23 @@ id=$(autolease run -- python train.py)
 id=$(autolease run -P 10 -- python debug.py)
 ```
 
-Use higher priority for interactive debugging. Use default (0) for batch training. All preemption events are logged to `autolease events`.
+Use higher priority for interactive debugging. Use default (0) for batch training.
+
+### Env override
+
+If you need a different env than the config default:
+
+```bash
+id=$(autolease run --env myenv -- python train.py)
+```
+
+### Skip sync
+
+If the code is already on the cluster or you're running a non-project command:
+
+```bash
+id=$(autolease run --no-sync -- nvidia-smi)
+```
 
 ### Project isolation
 
@@ -117,6 +135,25 @@ autolease wait $id
 
 ```bash
 autolease cancel $id
+```
+
+## Code sync
+
+Code files are auto-synced before each `run`. Only code files (`*.py`, `*.yaml`, `*.sh`, etc.) are synced — data, checkpoints, `.git` are excluded. Only files newer locally are transferred.
+
+Remote path mirrors your local path relative to `~`. For example, local `~/projects/my-model/` syncs to `~/projects/my-model/` on the cluster.
+
+To sync manually or preview:
+
+```bash
+autolease sync              # push code files now
+autolease sync --dry-run    # show what would be synced
+```
+
+To pull results back:
+
+```bash
+autolease pull results/     # pull results/ dir from remote project
 ```
 
 ## Typical agent workflow
@@ -185,7 +222,7 @@ autolease events -n 50   # last 50 events
 
 Example output:
 ```
-[2026-04-06T15:30:01] SUBMIT job 8 project=diffusion-lm priority=10 gpus=1
+[2026-04-06T15:30:01] SUBMIT job 8 project=diffusion-lm priority=10 gpus=1 cwd=~/projects/diffusion-lm
 [2026-04-06T15:30:01] PREEMPT job 5 (priority=0, project=sweep) on node15 — re-queued
 [2026-04-06T15:30:02] DISPATCH job 8 (priority=10) -> node15 (RTX3090) [preempted job 5]
 ```

@@ -2,7 +2,7 @@
 
 Personal GPU pool manager for shared Slurm clusters.
 
-autolease holds GPU allocations as persistent Slurm jobs and lets you (or your coding agents) submit work to them without fighting for resources each time. It handles QoS selection, bad-node detection, lease renewal, and job queuing across multiple projects.
+autolease holds GPU allocations as persistent Slurm jobs and lets you (or your coding agents) submit work to them without fighting for resources each time. It handles QoS selection, bad-node detection, lease renewal, job queuing, code sync, and conda env activation.
 
 ## Why
 
@@ -18,11 +18,12 @@ autolease solves this by maintaining a personal pool of held GPU allocations and
 ## How it works
 
 1. **Leases** are persistent `sbatch sleep` jobs that hold GPUs. You acquire them with `autolease up <partition>`.
-2. **Jobs** are submitted to leases via `srun --jobid --overlap`. They're async by default and queued across projects with round-robin fairness.
+2. **Jobs** are async. `autolease run` syncs your code, wraps it in your conda env, dispatches to a lease, and returns a job ID.
 3. **Priority & preemption**: higher-priority jobs (`-P 10`) preempt lower-priority running jobs. Preempted jobs are re-queued, not killed. Jobs prefer the smallest GPU that fits.
-4. **Health checks** run `nvidia-smi` on each lease. Bad nodes are auto-excluded.
-5. **QoS auto-selection** fills guaranteed slots first (`base_qos`), then overflows to preemptible (`big_qos`).
-6. **Preemption detection** notifies you when a lease disappears unexpectedly.
+4. **Code sync**: code files are auto-rsynced to the cluster before each job. Remote path mirrors your local path relative to `~`.
+5. **Health checks** run `nvidia-smi` on each lease. Bad nodes are auto-excluded.
+6. **QoS auto-selection** fills guaranteed slots first, then overflows to preemptible.
+7. **Preemption detection** notifies you when a lease disappears unexpectedly.
 
 ## Install
 
@@ -49,7 +50,7 @@ autolease up suma_rtx4090              # acquire 1 RTX4090, auto QoS, max time
 autolease up suma_a6000 -n 4           # acquire 4 A6000s
 autolease pool                         # see your leases
 
-# Submit work
+# Submit work (auto-syncs code, activates env)
 id=$(autolease run -- python train.py)
 autolease status $id                   # queued / running / done:0 / failed
 autolease log $id                      # read stdout
@@ -65,7 +66,11 @@ Config lives at `~/.config/autolease/config.yaml`:
 
 ```yaml
 ssh_host: your-cluster
-shell: fish          # remote shell (bash, fish, zsh)
+shell: fish              # remote shell (bash, fish, zsh)
+
+# Default conda/micromamba env for jobs
+env: dl
+env_activate: "micromamba run -n {env}"   # or "conda run -n {env}"
 
 exclude_nodes:
   - bad-node-01
@@ -76,7 +81,7 @@ qos:
   pro6000_qos: 4
 ```
 
-That's it. Partitions, GPU types, and allowed QoS lists are auto-discovered from the cluster via `scontrol`. VRAM is a built-in lookup table. You only need to declare QoS limits that affect your strategy.
+Partitions, GPU types, and allowed QoS lists are auto-discovered from the cluster via `scontrol`. VRAM is a built-in lookup table. You only need to declare QoS limits that affect your strategy.
 
 The `shell` setting controls which shell runs your commands on GPU nodes. Set it to match whatever shell has your conda/micromamba/module setup.
 
@@ -91,7 +96,8 @@ State and job data are stored in `~/.local/share/autolease/`.
 | `autolease up <partition> [-n GPUs] [-t TIME] [-q QOS]` | Acquire a lease. QoS auto-selected if omitted. Time defaults to partition max. |
 | `autolease down` | Release all leases |
 | `autolease pool` | Show leases with remaining time, detect lost leases |
-| `autolease check [--replace]` | Health-check leases. `--replace` auto-swaps bad ones. |
+| `autolease check [--replace]` | Quick health-check. `--replace` auto-swaps bad ones. |
+| `autolease test` | Thorough GPU test (nvidia-smi details + CUDA compute cap) |
 | `autolease renew [-t MINUTES]` | Renew leases within N minutes of expiry (default: 30) |
 | `autolease bad-nodes [--clear]` | Show or reset the bad-node list |
 
@@ -113,6 +119,17 @@ State and job data are stored in `~/.local/share/autolease/`.
 - `-n, --num-gpus` Number of GPUs (default: 1)
 - `--min-vram` Minimum VRAM per GPU in GB (e.g. `48`)
 - `-P, --priority` Job priority (default: 0). Higher priority jobs preempt lower ones.
+- `-e, --env` Conda/micromamba env (overrides config default)
+- `--no-sync` Skip code sync before submitting
+
+### Code sync
+
+| Command | Description |
+|---|---|
+| `autolease sync [--dry-run]` | Manually sync code files to cluster |
+| `autolease pull <path>` | Pull files from cluster (e.g. `results/`) |
+
+Code files (`*.py`, `*.yaml`, `*.sh`, etc.) are auto-synced before each `run`. Remote path mirrors your local path relative to `~`. Only files newer locally are transferred. Data, checkpoints, `.git`, and other non-code files are excluded.
 
 ### Events
 
@@ -150,16 +167,16 @@ State and job data are stored in `~/.local/share/autolease/`.
 
 ## QoS strategy
 
-QoS is auto-selected based on current usage:
+QoS is auto-selected based on current usage and configured limits:
 
-| QoS | Limit | Behavior |
+| QoS | Default limit | Behavior |
 |---|---|---|
 | `base_qos` | 8 GPUs/user | Guaranteed, non-preemptible. Used first. |
 | `big_qos` | Unlimited | Preemptible. Overflow when base_qos is full. |
 | `a100_qos` | Unlimited | Required for A100 partitions. |
 | `pro6000_qos` | 4 GPUs/user | Required for PRO6000 partitions. |
 
-You can override with `-q <qos>` on `autolease up`.
+Limits are configured in `config.yaml` under `qos:`. You can override with `-q <qos>` on `autolease up`.
 
 ## Architecture
 
@@ -167,17 +184,22 @@ You can override with `-q <qos>` on `autolease up`.
 autolease/
   cli.py       CLI entry point (argparse)
   tui.py       Interactive dashboard (textual)
-  config.py    Configuration, QoS strategy, partition map
+  config.py    Configuration, QoS strategy, partition discovery
   pool.py      Lease lifecycle: acquire, release, health-check, renew
   queue.py     Async job queue, dispatcher, remote execution
   slurm.py     Low-level Slurm commands over SSH
+  sync.py      Code file sync via rsync
 ```
 
 - **Leases** are `sbatch --wrap 'sleep infinity'` jobs. Work runs inside them via `srun --jobid --overlap`.
 - **Jobs** execute on the remote via `nohup srun ... &`, surviving SSH disconnects. Output is written to `~/.autolease/jobs/<id>/` on the cluster.
 - **State** is local JSON files. No database, no daemon.
-- **Dispatch** is opportunistic: every CLI call that touches the queue also dispatches pending jobs to free lease slots. Jobs prefer the smallest VRAM lease that fits their requirements.
-- **Priority preemption**: when a high-priority job has no free lease, it preempts the lowest-priority running job on a matching lease. The victim is re-queued. All events are logged to `events.log`.
+- **Dispatch** is opportunistic: every CLI call that touches the queue also dispatches pending jobs to free lease slots. Jobs prefer the smallest VRAM lease that fits.
+- **Priority preemption**: when a high-priority job has no free lease, it preempts the lowest-priority running job on a matching lease. The victim is re-queued. All events are logged.
+- **Code sync**: rsync with an allowlist of code file extensions. Only newer files are transferred. Remote path mirrors local `~/` structure.
+- **Env activation**: commands are wrapped with `env_activate` template (e.g. `micromamba run -n dl <command>`).
+- **Lease discovery**: `refresh()` scans `squeue` in a single SSH call and adopts any autolease-named jobs not in local state.
+- **Partition discovery**: partitions, GPU types, and QoS lists are auto-discovered from `scontrol show partition` + `sinfo`.
 
 ## License
 

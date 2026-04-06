@@ -1,7 +1,11 @@
 # autolease configuration
 # Copy to ~/.config/autolease/config.yaml
 ssh_host: your-cluster
-shell: bash          # remote shell for job execution (bash, fish, zsh)
+shell: bash              # remote shell (bash, fish, zsh)
+
+# Default conda/micromamba env for jobs (optional)
+# env: myenv
+# env_activate: "micromamba run -n {env}"   # or "conda run -n {env}"
 
 exclude_nodes: []
 

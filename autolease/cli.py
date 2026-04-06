@@ -214,6 +214,7 @@ def cmd_run(args):
         min_vram=args.min_vram,
         gpu_type=args.gpu_type,
         priority=args.priority,
+        env=args.env,
         no_sync=args.no_sync,
     )
     print(job.id)
@@ -410,6 +411,8 @@ def main():
                        help="Minimum VRAM per GPU in GB (e.g. 48)")
     run_p.add_argument("-P", "--priority", type=int, default=0,
                        help="Job priority (higher preempts lower, default: 0)")
+    run_p.add_argument("-e", "--env", default=None,
+                       help="Conda/micromamba env (overrides config default)")
     run_p.add_argument("--no-sync", action="store_true",
                        help="Skip code sync before submitting")
     run_p.add_argument("command", nargs=argparse.REMAINDER, help="Command to run")
