@@ -314,9 +314,12 @@ class JobQueue:
                 else:
                     del by_project[proj]
 
+        # Sort leases by VRAM ascending — fill small GPUs first
+        leases_by_vram = sorted(leases, key=lambda l: GPU_VRAM.get(l.gpu_type, 0))
+
         for job in rr_queue:
-            # Find a free matching lease
-            for lease in leases:
+            # Find a free matching lease (smallest GPU first)
+            for lease in leases_by_vram:
                 if not self._lease_matches(lease, job):
                     continue
                 if self._lease_is_busy(lease, running):

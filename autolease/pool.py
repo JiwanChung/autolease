@@ -349,8 +349,10 @@ class Pool:
 
     def find_running_lease(self, gpu_type: Optional[str] = None,
                            min_gpus: int = 1) -> Optional[Lease]:
-        """Find a running lease matching requirements."""
-        leases = self.refresh()
+        """Find a running lease matching requirements. Prefers smallest GPU first."""
+        from .config import GPU_VRAM
+        leases = sorted(self.refresh(),
+                        key=lambda l: GPU_VRAM.get(l.gpu_type, 0))
         for lease in leases:
             if lease.state != "RUNNING":
                 continue
