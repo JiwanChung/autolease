@@ -108,13 +108,13 @@ class JobQueue:
     def _launch_remote(self, job: Job, lease: Lease) -> Optional[int]:
         """Write script to remote, launch via nohup srun, return remote PID."""
         rdir = self._remote_job_dir(job.id)
+        sh = self.slurm.cfg.shell
         srun = f"srun --jobid={lease.job_id} --gres=gpu:{job.num_gpus} --overlap"
 
-        # Step 1: write the script and launcher to remote
+        # Step 1: write the job script to remote
         setup = (
             f"mkdir -p {rdir} && "
             f"cat > {rdir}/run.sh << '__AUTOLEASE_SCRIPT__'\n"
-            f"#!/bin/bash\n"
             f"{job.command}\n"
             f"__AUTOLEASE_SCRIPT__\n"
             f"chmod +x {rdir}/run.sh"
@@ -123,10 +123,10 @@ class JobQueue:
         if r.returncode != 0:
             return None
 
-        # Step 2: launch with nohup, capture PID
+        # Step 2: launch with nohup, using configured shell
         launch = (
             f"nohup bash -c '"
-            f"{srun} bash {rdir}/run.sh > {rdir}/stdout 2> {rdir}/stderr;"
+            f"{srun} {sh} {rdir}/run.sh > {rdir}/stdout 2> {rdir}/stderr;"
             f" echo $? > {rdir}/exit_code"
             f"' > /dev/null 2>&1 & echo $!"
         )

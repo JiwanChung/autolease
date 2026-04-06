@@ -1,6 +1,7 @@
 # autolease configuration
 # Copy to ~/.config/autolease/config.yaml
 ssh_host: your-cluster
+shell: bash          # remote shell for job execution (bash, fish, zsh)
 
 exclude_nodes: []
 

@@ -23,7 +23,7 @@ def _parse_slurm_time(s: str) -> Optional[datetime]:
 class Pool:
     def __init__(self, config: PoolConfig):
         self.config = config
-        self.slurm = Slurm(SlurmConfig(ssh_host=config.ssh_host))
+        self.slurm = Slurm(SlurmConfig(ssh_host=config.ssh_host, shell=config.shell))
         self._state_file = os.path.join(config.state_path, "state.json")
 
     # ── State persistence ──

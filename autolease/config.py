@@ -62,6 +62,7 @@ class LeaseSpec:
 @dataclass
 class PoolConfig:
     ssh_host: str = "localhost"
+    shell: str = "bash"  # remote shell for job execution (bash, fish, zsh)
     exclude_nodes: list[str] = field(default_factory=list)
     state_dir: str = ""
     qos_rules: dict[str, QoSRule] = field(default_factory=dict)
@@ -169,6 +170,7 @@ def load_config(path: Optional[str] = None) -> PoolConfig:
 
     return PoolConfig(
         ssh_host=raw.get("ssh_host", "localhost"),
+        shell=raw.get("shell", "bash"),
         exclude_nodes=raw.get("exclude_nodes", []),
         state_dir=raw.get("state_dir", str(_data_dir())),
         qos_rules=qos_rules,

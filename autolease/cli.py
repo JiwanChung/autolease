@@ -263,7 +263,7 @@ def cmd_cancel(args):
 def cmd_nodes(args):
     from .slurm import Slurm, SlurmConfig
     cfg = load_config(args.config)
-    slurm = Slurm(SlurmConfig(ssh_host=cfg.ssh_host))
+    slurm = Slurm(SlurmConfig(ssh_host=cfg.ssh_host, shell=cfg.shell))
     nodes = slurm.sinfo_gpus()
     print(f"{'NODE':<12}  {'GPU':<14}  {'#':>2}  {'MEM_MB':>8}  {'STATE':<12}")
     print("-" * 56)
@@ -361,7 +361,7 @@ def main():
     # Load config + discover cluster
     cfg = load_config(args.config)
     from .slurm import Slurm, SlurmConfig
-    discover_partitions(Slurm(SlurmConfig(ssh_host=cfg.ssh_host)))
+    discover_partitions(Slurm(SlurmConfig(ssh_host=cfg.ssh_host, shell=cfg.shell)))
     apply_qos_config(cfg)
 
     if args.cmd is None:

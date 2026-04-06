@@ -11,6 +11,7 @@ from typing import Optional
 class SlurmConfig:
     ssh_host: Optional[str] = None  # None = local
     ssh_opts: tuple = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
+    shell: str = "bash"  # remote shell for job execution
 
     def run(self, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
         if self.ssh_host:
@@ -281,14 +282,15 @@ class Slurm:
     def run_on_lease(self, job_id: int, command: str, num_gpus: int = 1,
                      timeout: int = 600) -> subprocess.CompletedProcess:
         """Run a command inside a held allocation via srun --jobid."""
+        sh = self.cfg.shell
         srun_prefix = f"srun --jobid={job_id} --gres=gpu:{num_gpus} --overlap"
-        # Pipe the user command through stdin to avoid quote-escaping hell
-        # across SSH + bash -c layers.
-        script = f"{srun_prefix} bash <<'__AUTOLEASE_EOF__'\n{command}\n__AUTOLEASE_EOF__"
+        # Pipe the user command through a heredoc to avoid quote-escaping hell
+        # across SSH + shell layers.
+        script = f"{srun_prefix} {sh} <<'__AUTOLEASE_EOF__'\n{command}\n__AUTOLEASE_EOF__"
         if self.cfg.ssh_host:
             full = ["ssh", *self.cfg.ssh_opts, self.cfg.ssh_host, script]
         else:
-            full = ["bash", "-c", script]
+            full = [sh, "-c", script]
         return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
 
     def my_jobs(self, name_prefix: str = "autolease") -> list[dict]:
