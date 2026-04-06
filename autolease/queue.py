@@ -22,6 +22,7 @@ class Job:
     num_gpus: int = 1
     min_vram: int = 0  # GB, 0 = any
     gpu_type: Optional[str] = None  # None = any
+    priority: int = 0  # higher = more important
     exit_code: Optional[int] = None
     lease_job_id: Optional[int] = None
     remote_pid: Optional[int] = None
@@ -52,9 +53,16 @@ def _detect_project() -> str:
 class JobQueue:
     def __init__(self, config: PoolConfig):
         self.config = config
-        self.slurm = Slurm(SlurmConfig(ssh_host=config.ssh_host))
+        self.slurm = Slurm(SlurmConfig(ssh_host=config.ssh_host, shell=config.shell))
         self._jobs_dir = os.path.join(config.state_path, "jobs")
         self._counter_file = os.path.join(config.state_path, "next_job_id")
+        self._log_file = os.path.join(config.state_path, "events.log")
+
+    def _log_event(self, msg: str):
+        """Append a timestamped event to the log file."""
+        os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
+        with open(self._log_file, "a") as f:
+            f.write(f"[{_now()}] {msg}\n")
 
     def _ensure_dirs(self):
         os.makedirs(self._jobs_dir, exist_ok=True)
@@ -85,7 +93,9 @@ class JobQueue:
         if not os.path.exists(p):
             return None
         with open(p) as f:
-            return Job(**json.load(f))
+            d = json.load(f)
+        d.setdefault("priority", 0)  # backward compat
+        return Job(**d)
 
     def _all_jobs(self) -> list[Job]:
         self._ensure_dirs()
@@ -94,7 +104,9 @@ class JobQueue:
             if fname.endswith(".json"):
                 try:
                     with open(os.path.join(self._jobs_dir, fname)) as f:
-                        jobs.append(Job(**json.load(f)))
+                        d = json.load(f)
+                    d.setdefault("priority", 0)
+                    jobs.append(Job(**d))
                 except (json.JSONDecodeError, TypeError):
                     continue
         jobs.sort(key=lambda j: j.id)
@@ -189,7 +201,8 @@ class JobQueue:
 
     def submit(self, command: str, project: Optional[str] = None,
                num_gpus: int = 1, min_vram: int = 0,
-               gpu_type: Optional[str] = None) -> Job:
+               gpu_type: Optional[str] = None,
+               priority: int = 0) -> Job:
         """Submit a new job to the queue. Returns the job."""
         if project is None:
             project = _detect_project()
@@ -201,9 +214,11 @@ class JobQueue:
             num_gpus=num_gpus,
             min_vram=min_vram,
             gpu_type=gpu_type,
+            priority=priority,
             submitted=_now(),
         )
         self._save_job(job)
+        self._log_event(f"SUBMIT job {job.id} project={project} priority={priority} gpus={num_gpus}")
         self.dispatch()
         return job
 
@@ -280,9 +295,25 @@ class JobQueue:
         """Check if a lease already has a job running on it."""
         return any(j.lease_job_id == lease.job_id for j in running_jobs)
 
+    def _preempt(self, victim: Job) -> None:
+        """Kill a running job and re-queue it."""
+        self._kill_remote(victim)
+        old_node = victim.node
+        victim.state = "queued"
+        victim.remote_pid = None
+        victim.lease_job_id = None
+        victim.node = None
+        victim.started = None
+        self._save_job(victim)
+        self._log_event(
+            f"PREEMPT job {victim.id} (priority={victim.priority}, "
+            f"project={victim.project}) on {old_node} — re-queued"
+        )
+
     def dispatch(self):
         """Try to dispatch queued jobs to free lease slots.
-        Uses round-robin across projects."""
+        Higher priority jobs dispatch first. If no free slot,
+        a higher-priority job can preempt a lower-priority running job."""
         from .pool import Pool
         pool = Pool(self.config)
         leases = pool.refresh()
@@ -295,37 +326,45 @@ class JobQueue:
             self._refresh_running(j)
         running = [j for j in self._all_jobs() if j.state == "running"]
 
-        queued = [j for j in all_jobs if j.state == "queued"]
+        queued = [j for j in self._all_jobs() if j.state == "queued"]
         if not queued:
             return
 
-        # Round-robin: group queued jobs by project, interleave
-        from collections import OrderedDict
-        by_project: OrderedDict[str, list[Job]] = OrderedDict()
-        for j in queued:
-            by_project.setdefault(j.project, []).append(j)
+        # Sort queued: highest priority first, then by submit time (id)
+        queued.sort(key=lambda j: (-j.priority, j.id))
 
-        # Interleave: take one from each project in turn
+        # Round-robin within same priority tier
+        from collections import OrderedDict
         rr_queue: list[Job] = []
-        while any(by_project.values()):
-            for proj in list(by_project.keys()):
-                if by_project[proj]:
-                    rr_queue.append(by_project[proj].pop(0))
-                else:
-                    del by_project[proj]
+        # Group by priority tier
+        tiers: dict[int, list[Job]] = {}
+        for j in queued:
+            tiers.setdefault(j.priority, []).append(j)
+
+        for pri in sorted(tiers.keys(), reverse=True):
+            tier_jobs = tiers[pri]
+            # Round-robin within this tier
+            by_project: OrderedDict[str, list[Job]] = OrderedDict()
+            for j in tier_jobs:
+                by_project.setdefault(j.project, []).append(j)
+            while any(by_project.values()):
+                for proj in list(by_project.keys()):
+                    if by_project[proj]:
+                        rr_queue.append(by_project[proj].pop(0))
+                    else:
+                        del by_project[proj]
 
         # Sort leases by VRAM ascending — fill small GPUs first
         leases_by_vram = sorted(leases, key=lambda l: GPU_VRAM.get(l.gpu_type, 0))
 
         for job in rr_queue:
-            # Find a free matching lease (smallest GPU first)
+            # Try free lease first
+            launched = False
             for lease in leases_by_vram:
                 if not self._lease_matches(lease, job):
                     continue
                 if self._lease_is_busy(lease, running):
                     continue
-
-                # Launch
                 pid = self._launch_remote(job, lease)
                 if pid:
                     job.state = "running"
@@ -334,10 +373,55 @@ class JobQueue:
                     job.node = lease.node
                     job.started = _now()
                     self._save_job(job)
+                    self._log_event(
+                        f"DISPATCH job {job.id} (priority={job.priority}) "
+                        f"-> {lease.node} ({lease.gpu_type})"
+                    )
                     running.append(job)
+                    launched = True
                     break
                 else:
                     job.state = "failed"
                     job.finished = _now()
                     self._save_job(job)
+                    launched = True
                     break
+
+            if launched:
+                continue
+
+            # No free lease — try preemption
+            # Find lowest-priority running job on a matching lease
+            candidates = []
+            for lease in leases_by_vram:
+                if not self._lease_matches(lease, job):
+                    continue
+                for rj in running:
+                    if rj.lease_job_id == lease.job_id and rj.priority < job.priority:
+                        candidates.append((rj, lease))
+
+            if not candidates:
+                continue  # no preemptable job, stays queued
+
+            # Preempt the lowest-priority one
+            candidates.sort(key=lambda x: (x[0].priority, -x[0].id))
+            victim, lease = candidates[0]
+
+            self._preempt(victim)
+            running = [r for r in running if r.id != victim.id]
+
+            # Launch on freed lease
+            pid = self._launch_remote(job, lease)
+            if pid:
+                job.state = "running"
+                job.remote_pid = pid
+                job.lease_job_id = lease.job_id
+                job.node = lease.node
+                job.started = _now()
+                self._save_job(job)
+                self._log_event(
+                    f"DISPATCH job {job.id} (priority={job.priority}) "
+                    f"-> {lease.node} ({lease.gpu_type}) "
+                    f"[preempted job {victim.id}]"
+                )
+                running.append(job)

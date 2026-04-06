@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -176,6 +177,7 @@ def cmd_run(args):
         num_gpus=args.num_gpus,
         min_vram=args.min_vram,
         gpu_type=args.gpu_type,
+        priority=args.priority,
     )
     print(job.id)
 
@@ -204,13 +206,13 @@ def cmd_jobs(args):
     if not jobs:
         print("No jobs.")
         return
-    print(f"{'ID':>5}  {'STATE':<10}  {'PROJECT':<20}  {'GPU':>4}  {'VRAM':>4}  {'NODE':<10}  {'CMD':<30}")
-    print("-" * 95)
+    print(f"{'ID':>5}  {'PRI':>3}  {'STATE':<10}  {'PROJECT':<20}  {'GPU':>4}  {'VRAM':>4}  {'NODE':<10}  {'CMD':<28}")
+    print("-" * 97)
     for j in jobs:
         state = f"done:{j.exit_code}" if j.state == "done" else j.state
-        cmd_short = j.command[:28] + ".." if len(j.command) > 30 else j.command
+        cmd_short = j.command[:26] + ".." if len(j.command) > 28 else j.command
         vram = f"{j.min_vram}G" if j.min_vram else "—"
-        print(f"{j.id:>5}  {state:<10}  {j.project:<20}  {j.num_gpus:>4}  {vram:>4}  {j.node or '—':<10}  {cmd_short:<30}")
+        print(f"{j.id:>5}  {j.priority:>3}  {state:<10}  {j.project:<20}  {j.num_gpus:>4}  {vram:>4}  {j.node or '—':<10}  {cmd_short:<28}")
 
 
 def cmd_log(args):
@@ -259,6 +261,19 @@ def cmd_cancel(args):
 
 
 # ── Info commands ──
+
+def cmd_events(args):
+    cfg = load_config(args.config)
+    log_file = os.path.join(cfg.state_path, "events.log")
+    if not os.path.exists(log_file):
+        print("No events yet.")
+        return
+    with open(log_file) as f:
+        lines = f.readlines()
+    tail = args.tail or 20
+    for line in lines[-tail:]:
+        print(line, end="")
+
 
 def cmd_nodes(args):
     from .slurm import Slurm, SlurmConfig
@@ -324,6 +339,8 @@ def main():
                        help="Number of GPUs needed (default: 1)")
     run_p.add_argument("--min-vram", type=int, default=0,
                        help="Minimum VRAM per GPU in GB (e.g. 48)")
+    run_p.add_argument("-P", "--priority", type=int, default=0,
+                       help="Job priority (higher preempts lower, default: 0)")
     run_p.add_argument("command", nargs=argparse.REMAINDER, help="Command to run")
 
     status_p = sub.add_parser("status", help="Get job state (one word)")
@@ -353,6 +370,9 @@ def main():
     sub.add_parser("tui", help="Interactive dashboard")
 
     # Info
+    events_p = sub.add_parser("events", help="Show dispatch/preemption event log")
+    events_p.add_argument("-n", "--tail", type=int, default=20,
+                          help="Show last N events (default: 20)")
     sub.add_parser("nodes", help="Show cluster GPU nodes")
     sub.add_parser("partitions", help="Show partition/QoS map")
 
@@ -383,6 +403,7 @@ def main():
         "wait": cmd_wait,
         "cancel": cmd_cancel,
         "tui": lambda args: __import__('autolease.tui', fromlist=['run_tui']).run_tui(args.config),
+        "events": cmd_events,
         "nodes": cmd_nodes,
         "partitions": cmd_partitions,
     }
