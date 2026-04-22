@@ -1,24 +1,47 @@
 """Low-level Slurm command wrappers. Runs commands via SSH or locally."""
 
 import json
+import os
 import subprocess
 import shlex
 from dataclasses import dataclass, field
 from typing import Optional
 
 
+def _control_socket_path() -> str:
+    """Path for the shared SSH control socket.
+    %C in ControlPath expands to a hash of host/port/user, so different
+    clusters get different sockets automatically."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.ssh")
+    os.makedirs(runtime, exist_ok=True)
+    return os.path.join(runtime, "autolease-cm-%C")
+
+
 @dataclass
 class SlurmConfig:
     ssh_host: Optional[str] = None  # None = local
-    ssh_opts: tuple = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
     shell: str = "bash"  # remote shell for job execution
+    # SSH options. ControlMaster reuses a single TCP connection across all
+    # ssh invocations (massive speedup for polling/refresh loops).
+    ssh_opts: tuple = (
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={_control_socket_path()}",
+        "-o", "ControlPersist=10m",
+    )
 
     def run(self, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
         if self.ssh_host:
             full = ["ssh", *self.ssh_opts, self.ssh_host, cmd]
         else:
             full = ["bash", "-c", cmd]
-        return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(full, capture_output=True, timeout=timeout)
+        return subprocess.CompletedProcess(
+            r.args, r.returncode,
+            stdout=r.stdout.decode("utf-8", errors="replace"),
+            stderr=r.stderr.decode("utf-8", errors="replace"),
+        )
 
 
 @dataclass
@@ -69,6 +92,37 @@ class Lease:
             end_time=d.get("end_time"),
             time_limit=d.get("time_limit"),
         )
+
+
+def _parse_gpu_count(gres: str) -> int:
+    """Parse GPU count from various squeue GRES/TRES formats.
+    Handles: 'gpu:2', 'gpu:RTX3090:2', 'gres/gpu:2', 'gres/gpu:RTX3090:2',
+    'gres/gpu=2', 'gres/gpu:RTX3090=2', and comma-separated TRES like
+    'billing=1,cpu=1,gres/gpu=2,mem=8G'."""
+    import re
+    if not gres:
+        return 0
+    total = 0
+    matched = False
+    # Comma-separated TRES: look for each gres/gpu entry
+    for item in gres.split(","):
+        item = item.strip()
+        # Match both = and : as separators, with optional GPU type
+        # e.g. gres/gpu:4, gres/gpu=4, gres/gpu:RTX3090:4, gres/gpu:RTX3090=4
+        m = re.match(r'gres/gpu(?::\w+)?[=:](\d+)', item)
+        if m:
+            total += int(m.group(1))
+            matched = True
+    if matched:
+        return total
+    # Plain GRES: gpu:N or gpu:TYPE:N
+    if gres.startswith("gpu"):
+        parts = gres.split(":")
+        for p in reversed(parts):
+            p = p.strip()
+            if p.isdigit():
+                return int(p)
+    return 0
 
 
 class Slurm:
@@ -218,13 +272,7 @@ class Slurm:
                 continue
             qos = parts[0].strip()
             gres = parts[1].strip()
-            # Parse gres like "gpu:2" or "gpu:RTX3090:2"
-            gpus = 0
-            if gres.startswith("gpu"):
-                try:
-                    gpus = int(gres.split(":")[-1])
-                except ValueError:
-                    pass
+            gpus = _parse_gpu_count(gres)
             usage[qos] = usage.get(qos, 0) + gpus
         return usage
 
@@ -291,7 +339,12 @@ class Slurm:
             full = ["ssh", *self.cfg.ssh_opts, self.cfg.ssh_host, script]
         else:
             full = [sh, "-c", script]
-        return subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(full, capture_output=True, timeout=timeout)
+        return subprocess.CompletedProcess(
+            r.args, r.returncode,
+            stdout=r.stdout.decode("utf-8", errors="replace"),
+            stderr=r.stderr.decode("utf-8", errors="replace"),
+        )
 
     def my_jobs(self, name_prefix: str = "autolease") -> list[dict]:
         """List the user's current jobs matching a name prefix.

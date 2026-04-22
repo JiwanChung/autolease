@@ -38,10 +38,27 @@ QoS is auto-selected. Time defaults to partition max. No other config needed.
 Every `run` is async. It returns a bare job ID on stdout. Code files are auto-synced to the cluster before dispatch. The configured conda/micromamba env is auto-activated.
 
 ```bash
-id=$(autolease run -- python train.py --lr 0.001)
+# Capture the job ID for this shell
+export AUTOLEASE_JOB_ID=$(autolease run -- python train.py --lr 0.001)
+
+# Or submit and immediately tail output
+autolease run --poll -- python train.py --lr 0.001
 ```
 
 The command runs in the synced project directory on the cluster, with the configured env active. You don't need to `cd`, `rsync`, or `conda activate` manually.
+
+Once `AUTOLEASE_JOB_ID` is exported, subsequent shortcut commands work without a job ID:
+
+```bash
+autolease poll         # tail stdout, refreshes every 10s
+autolease log          # read stdout
+autolease log --stderr # read stderr
+autolease status       # one-word state
+autolease cancel       # kill it
+autolease redo         # re-submit the same command
+```
+
+The env var is per-shell. A different terminal has its own `AUTOLEASE_JOB_ID`. If the var isn't set, these commands fail with a helpful message — they never fall back to some "recent" global job.
 
 ### Resource requirements
 
@@ -99,7 +116,8 @@ id=$(autolease run -p my-project -- python test.py)
 ## Checking job state
 
 ```bash
-autolease status $id
+autolease status           # uses AUTOLEASE_JOB_ID
+autolease status $id       # or pass explicitly
 ```
 
 Returns one word:
@@ -112,16 +130,27 @@ Returns one word:
 For full details:
 
 ```bash
-autolease status $id --json
+autolease status --json
 ```
 
 ## Reading output
 
 ```bash
-autolease log $id              # stdout
-autolease log $id --stderr     # stderr
-autolease log $id -n 20        # last 20 lines
+autolease log              # stdout of $AUTOLEASE_JOB_ID
+autolease log --stderr     # stderr
+autolease log -n 20        # last 20 lines
+autolease log $id          # or pass a job ID explicitly
 ```
+
+## Tailing output live
+
+```bash
+autolease poll             # clears screen, reprints last 30 lines every 10s
+autolease poll -i 5        # 5s refresh
+autolease poll $id         # explicit job ID
+```
+
+`poll` uses one SSH call per cycle (same as `watch -n 10 autolease log $id -n 30`). Exits when the job finishes.
 
 ## Waiting for completion
 
@@ -134,8 +163,35 @@ autolease wait $id
 ## Cancelling jobs
 
 ```bash
+autolease cancel           # cancels $AUTOLEASE_JOB_ID
 autolease cancel $id
 ```
+
+## Re-running a job
+
+```bash
+autolease redo             # re-submit the same command as $AUTOLEASE_JOB_ID
+autolease redo $id         # or a specific old job
+autolease redo --poll      # and start polling immediately
+```
+
+`redo` prints a new job ID. Capture it in the env var the same way:
+
+```bash
+export AUTOLEASE_JOB_ID=$(autolease redo)
+```
+
+## Interactive shell on a lease
+
+```bash
+autolease shell                # shell on first running lease
+autolease shell 12345          # specific lease by job ID
+autolease shell -g A6000       # lease with A6000 GPU
+autolease shell -n 4           # request 4 GPUs from the lease
+autolease shell -s zsh         # override shell (default: config.shell)
+```
+
+Opens via `ssh -t ... srun --jobid=<lease> --overlap --pty <shell>` so you land on the compute node with the GPUs available to your session.
 
 ## Code sync
 
@@ -163,22 +219,22 @@ autolease pull results/     # pull results/ dir from remote project
 ```bash
 # Write code, test on GPU, read output, iterate
 # Use -P 10 so debug runs preempt background training if needed
-id=$(autolease run -P 10 -- python test_forward.py)
-autolease wait $id
+export AUTOLEASE_JOB_ID=$(autolease run -P 10 -- python test_forward.py)
+autolease wait $AUTOLEASE_JOB_ID
 # ... read output, fix code ...
-id=$(autolease run -P 10 -- python test_forward.py)
-autolease wait $id
+export AUTOLEASE_JOB_ID=$(autolease redo)
+autolease wait $AUTOLEASE_JOB_ID
 ```
 
 ### Fire and check later
 
 ```bash
 # Kick off training (default priority — can be preempted by debug runs)
-id=$(autolease run -- python train.py --epochs 50)
+export AUTOLEASE_JOB_ID=$(autolease run -- python train.py --epochs 50)
 # ... do other work ...
-autolease status $id        # check progress
-autolease log $id -n 10     # peek at recent output
-autolease wait $id          # block when ready to see results
+autolease status            # check progress
+autolease log -n 10         # peek at recent output
+autolease poll              # or tail live
 ```
 
 ### Multiple projects
@@ -199,6 +255,12 @@ while true; do
         *) sleep 5 ;;
     esac
 done
+```
+
+Or simpler, using the built-in poller:
+
+```bash
+autolease run --poll -- python experiment.py
 ```
 
 ### Batch submit
@@ -242,3 +304,19 @@ Example output:
 | `autolease status` | 0 if job exists, 1 if unknown |
 | `autolease wait` | Job's exit code |
 | `autolease cancel` | 0 if cancelled, 1 if not found |
+
+## SSH load
+
+autolease is designed to be a polite SSH client:
+
+- All `ssh` and `rsync` calls share an OpenSSH ControlMaster connection. After the first command, everything else multiplexes over the same TCP connection (~5ms per call instead of ~500ms). The cluster's sshd sees one connection, not a flood. The control socket lives at `$XDG_RUNTIME_DIR/autolease-cm-%C` (or `~/.ssh/autolease-cm-%C`) and persists for 10 minutes after the last call.
+- Read-only commands (`status`, `log`, `jobs`) never call `dispatch()` — they only make the SSH calls they need. A bare `autolease status $id` is one SSH call (`kill -0 $pid || cat exit_code`).
+- The dispatcher short-circuits with zero SSH if the queue is empty.
+- The TUI's 30-second refresh does one `squeue` + one combined-PID-check per running job + (optional) one `squeue` if there's anything to dispatch. No periodic log polling.
+- `autolease poll` does one `tail -n 30` per cycle (default 10s) and a local-only state check.
+
+To manually tear down the multiplexed connection:
+
+```bash
+ssh -O exit -o ControlPath=$XDG_RUNTIME_DIR/autolease-cm-%C <host>
+```

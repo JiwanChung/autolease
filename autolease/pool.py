@@ -199,13 +199,21 @@ class Pool:
                 # Orphan — adopt it
                 gres = sj.get("gres", "")
                 num_gpus = 1
+                gpu_type = "unknown"
                 if gres:
+                    # Parse GRES like "gpu:RTX4090:2" or "gpu:2"
+                    gparts = gres.split(":")
                     try:
-                        num_gpus = int(gres.split(":")[-1])
+                        num_gpus = int(gparts[-1])
                     except ValueError:
                         pass
-                pinfo = PARTITION_INFO.get(sj["partition"])
-                gpu_type = pinfo[1] if pinfo else "unknown"
+                    if len(gparts) >= 3:
+                        gpu_type = gparts[1]
+                # Fallback to PARTITION_INFO if GRES didn't have GPU type
+                if gpu_type == "unknown":
+                    pinfo = PARTITION_INFO.get(sj["partition"])
+                    if pinfo:
+                        gpu_type = pinfo[1]
                 lease = Lease(
                     job_id=jid,
                     partition=sj["partition"],

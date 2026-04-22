@@ -51,10 +51,22 @@ autolease up suma_a6000 -n 4           # acquire 4 A6000s
 autolease pool                         # see your leases
 
 # Submit work (auto-syncs code, activates env)
-id=$(autolease run -- python train.py)
-autolease status $id                   # queued / running / done:0 / failed
-autolease log $id                      # read stdout
-autolease wait $id                     # block until done, print output
+export AUTOLEASE_JOB_ID=$(autolease run -- python train.py)
+
+# Per-shell job shortcuts (reads AUTOLEASE_JOB_ID):
+autolease poll                         # tail stdout, refreshing every 10s
+autolease log                          # read stdout
+autolease log --stderr                 # read stderr
+autolease status                       # queued / running / done:0 / failed
+autolease cancel                       # kill the job
+autolease redo                         # re-submit the same command
+
+# Or pass job IDs explicitly:
+autolease log 42
+autolease cancel 42
+
+# Submit and immediately start polling:
+autolease run --poll -- python train.py
 
 # Done for the day
 autolease down                         # release all leases
@@ -100,17 +112,22 @@ State and job data are stored in `~/.local/share/autolease/`.
 | `autolease test` | Thorough GPU test (nvidia-smi details + CUDA compute cap) |
 | `autolease renew [-t MINUTES]` | Renew leases within N minutes of expiry (default: 30) |
 | `autolease bad-nodes [--clear]` | Show or reset the bad-node list |
+| `autolease shell [lease_id] [-g TYPE] [-n GPUs] [-s SHELL]` | Open an interactive shell on a lease via `srun --pty` |
 
 ### Job queue
 
+All job commands accept an optional job ID. If omitted, they read `AUTOLEASE_JOB_ID` from the environment, or fall back to the last submitted job.
+
 | Command | Description |
 |---|---|
-| `autolease run [opts] -- <command>` | Submit a job (prints job ID) |
-| `autolease status <id> [--json]` | One-word state: `queued`, `running`, `done:0`, `failed` |
+| `autolease run [opts] -- <command>` | Submit a job (prints job ID to stdout) |
+| `autolease poll [id] [-i SECS]` | Tail stdout, refreshing periodically (default: 10s) |
+| `autolease status [id] [--json]` | One-word state: `queued`, `running`, `done:0`, `failed` |
 | `autolease jobs [project] [-a]` | List jobs, optionally filtered by project |
-| `autolease log <id> [--stderr] [-n LINES]` | Read job output |
+| `autolease log [id] [--stderr] [-n LINES]` | Read job output |
 | `autolease wait <id>` | Block until done, print output, exit with job's code |
-| `autolease cancel <id>` | Kill a queued or running job |
+| `autolease cancel [id]` | Kill a queued or running job |
+| `autolease redo [id] [--poll]` | Re-submit the same command as a previous job |
 
 **`run` options:**
 
@@ -121,6 +138,7 @@ State and job data are stored in `~/.local/share/autolease/`.
 - `-P, --priority` Job priority (default: 0). Higher priority jobs preempt lower ones.
 - `-e, --env` Conda/micromamba env (overrides config default)
 - `--no-sync` Skip code sync before submitting
+- `--poll` Auto-start polling after submit
 
 ### Code sync
 
@@ -155,15 +173,17 @@ Code files (`*.py`, `*.yaml`, `*.sh`, etc.) are auto-synced before each `run`. R
 
 | Key | Action |
 |---|---|
+| `h/j/k/l` | Navigate: focus left panel / cursor down / cursor up / focus right panel |
 | `a` | Acquire lease (opens modal with per-node availability) |
-| `d` | Release selected lease |
-| `D` | Release all leases |
-| `l` | View stdout of selected job |
-| `e` | View stderr of selected job |
-| `c` | Cancel selected job |
-| `h` | Health-check all leases |
+| `d` | Release selected lease (with confirmation) |
+| `D` | Release all leases (with confirmation) |
+| `e` | Toggle stdout/stderr of selected job |
+| `c` | Cancel selected lease or job depending on focus (with confirmation) |
+| `H` | Health-check all leases |
 | `r` | Force refresh |
 | `q` | Quit |
+
+Selecting a job (arrow keys, j/k, or mouse) auto-loads its log in the output panel. Panel titles show aggregate stats (QoS usage, running job count, GPUs used).
 
 ## QoS strategy
 
@@ -194,12 +214,14 @@ autolease/
 - **Leases** are `sbatch --wrap 'sleep infinity'` jobs. Work runs inside them via `srun --jobid --overlap`.
 - **Jobs** execute on the remote via `nohup srun ... &`, surviving SSH disconnects. Output is written to `~/.autolease/jobs/<id>/` on the cluster.
 - **State** is local JSON files. No database, no daemon.
-- **Dispatch** is opportunistic: every CLI call that touches the queue also dispatches pending jobs to free lease slots. Jobs prefer the smallest VRAM lease that fits.
+- **Dispatch** is opportunistic: write-path commands (`run`, `cancel`, `up`, `down`) and the TUI refresh dispatch pending jobs. Read-only commands (`status`, `log`, `jobs`) never dispatch — they only do the SSH calls they actually need. Jobs prefer the smallest VRAM lease that fits.
 - **Priority preemption**: when a high-priority job has no free lease, it preempts the lowest-priority running job on a matching lease. The victim is re-queued. All events are logged.
 - **Code sync**: rsync with an allowlist of code file extensions. Only newer files are transferred. Remote path mirrors local `~/` structure.
 - **Env activation**: commands are wrapped with `env_activate` template (e.g. `micromamba run -n dl <command>`).
 - **Lease discovery**: `refresh()` scans `squeue` in a single SSH call and adopts any autolease-named jobs not in local state.
 - **Partition discovery**: partitions, GPU types, and QoS lists are auto-discovered from `scontrol show partition` + `sinfo`.
+- **SSH connection reuse**: every `ssh` and `rsync` autolease runs goes through an OpenSSH ControlMaster connection (socket at `$XDG_RUNTIME_DIR/autolease-cm-%C`, 10-minute persistence). The first call establishes a TCP/auth handshake; subsequent calls multiplex over the same connection (~5ms each). The TUI refresh, `autolease poll`, and concurrent commands all share one connection per cluster.
+- **Per-job SSH cost**: `_check_remote` checks PID liveness and exit code in one combined shell command (1 SSH per running job, not 2–3). The dispatcher short-circuits before any SSH calls when the queue is empty.
 
 ## License
 

@@ -109,6 +109,10 @@ def discover_partitions(slurm) -> None:
         pass
 
     PARTITION_INFO.clear()
+
+    # Collect all QoS names mentioned across partitions
+    all_qos_names: set[str] = set()
+    parsed_partitions: list[tuple[str, str, str]] = []  # (name, allow_qos, gpu)
     for line in r.stdout.strip().splitlines():
         info = {}
         for token in line.split():
@@ -117,13 +121,28 @@ def discover_partitions(slurm) -> None:
                 info[k] = v
         name = info.get("PartitionName", "")
         allow_qos = info.get("AllowQos", "")
-        if not name or allow_qos in ("", "ALL"):
+        if not name:
             continue
-        qos_list = [q.strip() for q in allow_qos.split(",") if q.strip()]
         gpu = gpu_types.get(name, "unknown")
-        PARTITION_INFO[name] = (qos_list, gpu)
+        if allow_qos and allow_qos != "ALL":
+            qos_list = [q.strip() for q in allow_qos.split(",") if q.strip()]
+            all_qos_names.update(qos_list)
+        parsed_partitions.append((name, allow_qos, gpu))
 
-    QOS_GPU_LIMITS.clear()
+    for name, allow_qos, gpu in parsed_partitions:
+        if not allow_qos:
+            continue
+        if allow_qos == "ALL":
+            # Use all known QoS names (from other partitions + config)
+            known = all_qos_names | set(QOS_GPU_LIMITS.keys())
+            # Prefer limited QoS first (guaranteed slots), unlimited last
+            qos_list = sorted(known,
+                              key=lambda q: (0 if QOS_GPU_LIMITS.get(q, 0) > 0 else 1, q))
+            if not qos_list:
+                qos_list = ["base_qos"]
+        else:
+            qos_list = [q.strip() for q in allow_qos.split(",") if q.strip()]
+        PARTITION_INFO[name] = (qos_list, gpu)
 
 
 def apply_qos_config(cfg: PoolConfig) -> None:
@@ -136,9 +155,17 @@ def apply_qos_config(cfg: PoolConfig) -> None:
 def pick_qos(partition: str, num_gpus: int, usage: dict[str, int]) -> str:
     """Auto-select the best QoS for a partition given current usage."""
     info = PARTITION_INFO.get(partition)
-    if not info:
-        return "base_qos"
-    preference = info[0]
+    if info:
+        preference = info[0]
+    else:
+        # Partition not in PARTITION_INFO (AllowQos empty or discovery failed).
+        # Build preference from all configured QoS, limited first.
+        preference = sorted(
+            QOS_GPU_LIMITS.keys(),
+            key=lambda q: (0 if QOS_GPU_LIMITS.get(q, 0) > 0 else 1, q),
+        )
+        if not preference:
+            return "base_qos"
 
     for qos in preference:
         limit = QOS_GPU_LIMITS.get(qos, 0)

@@ -199,6 +199,22 @@ def cmd_bad_nodes(args):
 
 # ── Job commands ──
 
+def _get_job_id(args, cfg) -> int:
+    """Get job ID from args or AUTOLEASE_JOB_ID env var."""
+    jid = getattr(args, "job_id", None)
+    if jid is not None:
+        return jid
+    env_id = os.environ.get("AUTOLEASE_JOB_ID")
+    if env_id:
+        return int(env_id)
+    print(
+        "No job ID. Pass one, or set AUTOLEASE_JOB_ID in your shell:\n"
+        "  export AUTOLEASE_JOB_ID=$(autolease run -- <command>)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def cmd_run(args):
     cfg = load_config(args.config)
     q = JobQueue(cfg)
@@ -218,12 +234,16 @@ def cmd_run(args):
         no_sync=args.no_sync,
     )
     print(job.id)
+    if args.poll:
+        _do_poll(q, job.id)
 
 
 def cmd_status(args):
     cfg = load_config(args.config)
     q = JobQueue(cfg)
-    job = q.get(args.job_id)
+    job_id = _get_job_id(args, cfg)
+    # Read-only: refresh remote state (1 SSH) but don't dispatch
+    job = q.get(job_id, dispatch=False)
     if job is None:
         print(f"unknown", file=sys.stderr)
         sys.exit(1)
@@ -240,7 +260,9 @@ def cmd_status(args):
 def cmd_jobs(args):
     cfg = load_config(args.config)
     q = JobQueue(cfg)
-    jobs = q.list_jobs(project=args.project, active_only=args.active)
+    # Read-only: refresh remote state but don't dispatch
+    jobs = q.list_jobs(project=args.project, active_only=args.active,
+                       dispatch=False)
     if not jobs:
         print("No jobs.")
         return
@@ -256,16 +278,19 @@ def cmd_jobs(args):
 def cmd_log(args):
     cfg = load_config(args.config)
     q = JobQueue(cfg)
+    job_id = _get_job_id(args, cfg)
     stream = "stderr" if args.stderr else "stdout"
-    out = q.read_log(args.job_id, stream=stream, tail=args.tail)
+    # 1 SSH call — just tail the log
+    out = q.read_log(job_id, stream=stream, tail=args.tail)
     if out:
         print(out, end="")
     else:
-        job = q.get(args.job_id)
+        # Fallback: local-only load to report state
+        job = q.get(job_id, refresh=False, dispatch=False)
         if job is None:
-            print(f"Job {args.job_id} not found.", file=sys.stderr)
+            print(f"Job {job_id} not found.", file=sys.stderr)
         elif job.state == "queued":
-            print(f"Job {args.job_id} is queued (no output yet).", file=sys.stderr)
+            print(f"Job {job_id} is queued (no output yet).", file=sys.stderr)
 
 
 def cmd_wait(args):
@@ -287,15 +312,108 @@ def cmd_wait(args):
         time.sleep(args.poll)
 
 
+def _do_poll(q: JobQueue, job_id: int, interval: float = 10.0, tail_n: int = 30):
+    """Polling loop: tail stdout, single SSH call per cycle."""
+    try:
+        while True:
+            out = q.read_log(job_id, stream="stdout", tail=tail_n) or ""
+
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            if out:
+                print(out, end="", flush=True)
+
+            job = q._load_job(job_id)
+            if job and job.state in ("done", "failed"):
+                exit_str = f"exit {job.exit_code}" if job.exit_code is not None else "exit ?"
+                print(f"\n--- job {job_id} {job.state} ({exit_str}) ---",
+                      file=sys.stderr)
+                sys.exit(job.exit_code or 0)
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(f"\n--- stopped polling job {job_id} ---", file=sys.stderr)
+
+
+def cmd_poll(args):
+    """Tail stdout and stderr of a job, refreshing periodically."""
+    cfg = load_config(args.config)
+    q = JobQueue(cfg)
+    job_id = _get_job_id(args, cfg)
+    _do_poll(q, job_id, interval=args.interval)
+
+
 def cmd_cancel(args):
     cfg = load_config(args.config)
     q = JobQueue(cfg)
-    ok = q.cancel(args.job_id)
+    job_id = _get_job_id(args, cfg)
+    ok = q.cancel(job_id)
     if ok:
-        print(f"Cancelled job {args.job_id}.")
+        print(f"Cancelled job {job_id}.")
     else:
-        print(f"Job {args.job_id} not found or already finished.", file=sys.stderr)
+        print(f"Job {job_id} not found or already finished.", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_redo(args):
+    """Re-submit the same command as a previous job."""
+    cfg = load_config(args.config)
+    q = JobQueue(cfg)
+    job_id = _get_job_id(args, cfg)
+    old_job = q._load_job(job_id)
+    if old_job is None:
+        print(f"Job {job_id} not found.", file=sys.stderr)
+        sys.exit(1)
+    new_job = q.submit(
+        command=old_job.command,
+        project=old_job.project,
+        num_gpus=old_job.num_gpus,
+        min_vram=old_job.min_vram,
+        gpu_type=old_job.gpu_type,
+        priority=old_job.priority,
+        no_sync=False,
+    )
+    print(new_job.id)
+    if args.poll:
+        _do_poll(q, new_job.id)
+
+
+def cmd_shell(args):
+    """Open an interactive shell on a held lease via srun --pty."""
+    import subprocess
+    cfg = load_config(args.config)
+    pool = Pool(cfg)
+
+    if args.lease_id is not None:
+        leases = [l for l in pool.status() if l.job_id == args.lease_id]
+        if not leases:
+            print(f"Lease {args.lease_id} not found.", file=sys.stderr)
+            sys.exit(1)
+        lease = leases[0]
+        if lease.state != "RUNNING":
+            print(f"Lease {args.lease_id} is {lease.state}, not RUNNING.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        lease = pool.find_running_lease(gpu_type=args.gpu_type, min_gpus=args.num_gpus)
+        if lease is None:
+            msg = "No running lease found"
+            if args.gpu_type:
+                msg += f" for gpu_type={args.gpu_type}"
+            print(msg + ".", file=sys.stderr)
+            sys.exit(1)
+
+    shell = args.shell or cfg.shell
+    print(f"Opening {shell} on lease {lease.job_id} ({lease.node} / {lease.gpu_type} x{args.num_gpus})...",
+          file=sys.stderr)
+    srun = (
+        f"srun --jobid={lease.job_id} --gres=gpu:{args.num_gpus} --overlap"
+        f" --pty {shell}"
+    )
+    if cfg.ssh_host:
+        cmd = ["ssh", "-t", *pool.slurm.cfg.ssh_opts, cfg.ssh_host, srun]
+    else:
+        cmd = ["bash", "-c", srun]
+    sys.exit(subprocess.call(cmd))
 
 
 # ── Info commands ──
@@ -415,10 +533,13 @@ def main():
                        help="Conda/micromamba env (overrides config default)")
     run_p.add_argument("--no-sync", action="store_true",
                        help="Skip code sync before submitting")
+    run_p.add_argument("--poll", action="store_true",
+                       help="Auto-start polling after submit")
     run_p.add_argument("command", nargs=argparse.REMAINDER, help="Command to run")
 
     status_p = sub.add_parser("status", help="Get job state (one word)")
-    status_p.add_argument("job_id", type=int, help="Job ID")
+    status_p.add_argument("job_id", type=int, nargs="?", default=None,
+                          help="Job ID (default: AUTOLEASE_JOB_ID or last job)")
     status_p.add_argument("--json", action="store_true", help="Full JSON output")
 
     jobs_p = sub.add_parser("jobs", help="List jobs")
@@ -427,7 +548,8 @@ def main():
                         help="Only show queued/running jobs")
 
     log_p = sub.add_parser("log", help="Read job output")
-    log_p.add_argument("job_id", type=int, help="Job ID")
+    log_p.add_argument("job_id", type=int, nargs="?", default=None,
+                       help="Job ID (default: AUTOLEASE_JOB_ID or last job)")
     log_p.add_argument("--stderr", action="store_true", help="Show stderr instead")
     log_p.add_argument("-n", "--tail", type=int, default=None,
                        help="Show last N lines")
@@ -437,8 +559,23 @@ def main():
     wait_p.add_argument("--poll", type=float, default=2.0,
                         help="Poll interval in seconds (default: 2)")
 
+    poll_p = sub.add_parser("poll", help="Tail stdout+stderr of a job, refreshing periodically")
+    poll_p.add_argument("job_id", type=int, nargs="?", default=None,
+                        help="Job ID (default: AUTOLEASE_JOB_ID or last job)")
+    poll_p.add_argument("-n", "--tail", type=int, default=50,
+                        help="Initial lines to show (default: 50)")
+    poll_p.add_argument("-i", "--interval", type=float, default=2.0,
+                        help="Refresh interval in seconds (default: 2)")
+
     cancel_p = sub.add_parser("cancel", help="Cancel a queued or running job")
-    cancel_p.add_argument("job_id", type=int, help="Job ID")
+    cancel_p.add_argument("job_id", type=int, nargs="?", default=None,
+                          help="Job ID (default: AUTOLEASE_JOB_ID or last job)")
+
+    redo_p = sub.add_parser("redo", help="Re-submit the same command as a previous job")
+    redo_p.add_argument("job_id", type=int, nargs="?", default=None,
+                        help="Job ID to redo (default: AUTOLEASE_JOB_ID or last job)")
+    redo_p.add_argument("--poll", action="store_true",
+                        help="Auto-start polling after submit")
 
     # Sync
     sync_p = sub.add_parser("sync", help="Sync code files to cluster")
@@ -446,6 +583,17 @@ def main():
 
     pull_p = sub.add_parser("pull", help="Pull files from cluster")
     pull_p.add_argument("path", help="Remote subpath to pull (e.g. results/)")
+
+    # Interactive shell on a lease
+    shell_p = sub.add_parser("shell", help="Open an interactive shell on a held lease")
+    shell_p.add_argument("lease_id", type=int, nargs="?", default=None,
+                         help="Lease job ID (default: first running lease)")
+    shell_p.add_argument("-g", "--gpu-type", default=None,
+                         help="Match a lease with this GPU type")
+    shell_p.add_argument("-n", "--num-gpus", type=int, default=1,
+                         help="GPUs to request from the lease (default: 1)")
+    shell_p.add_argument("-s", "--shell", default=None,
+                         help="Shell to run (default: config.shell)")
 
     # TUI
     sub.add_parser("tui", help="Interactive dashboard")
@@ -469,7 +617,7 @@ def main():
         return
 
     # Only discover partitions for commands that need it
-    needs_discovery = {"up", "partitions", "nodes", "pool", "check", "test", "run"}
+    needs_discovery = {"up", "partitions", "nodes", "pool", "check", "test", "run", "redo"}
     if args.cmd in needs_discovery:
         from .slurm import Slurm, SlurmConfig
         discover_partitions(Slurm(SlurmConfig(ssh_host=cfg.ssh_host, shell=cfg.shell)))
@@ -487,7 +635,10 @@ def main():
         "jobs": cmd_jobs,
         "log": cmd_log,
         "wait": cmd_wait,
+        "poll": cmd_poll,
         "cancel": cmd_cancel,
+        "redo": cmd_redo,
+        "shell": cmd_shell,
         "tui": lambda args: __import__('autolease.tui', fromlist=['run_tui']).run_tui(args.config),
         "sync": cmd_sync,
         "pull": cmd_pull,

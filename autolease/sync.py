@@ -117,8 +117,17 @@ def sync(config: PoolConfig,
     inc = include or DEFAULT_INCLUDE
     exc = exclude or DEFAULT_EXCLUDE
 
+    # Let rsync reuse the autolease SSH ControlMaster connection
+    from .slurm import _control_socket_path
+    ssh_cmd = (
+        "ssh -o BatchMode=yes -o ConnectTimeout=10"
+        " -o ControlMaster=auto"
+        f" -o ControlPath={_control_socket_path()}"
+        " -o ControlPersist=10m"
+    )
     cmd = [
         "rsync", "-az", "--update",  # skip files newer on remote
+        "-e", ssh_cmd,
     ]
 
     # Excludes first — these take priority
@@ -169,7 +178,14 @@ def pull(config: PoolConfig,
     src = f"{config.ssh_host}:{remote_dir}/{remote_subpath}"
     dst = str(project_root / remote_subpath)
 
-    cmd = ["rsync", "-az", src, dst]
+    from .slurm import _control_socket_path
+    ssh_cmd = (
+        "ssh -o BatchMode=yes -o ConnectTimeout=10"
+        " -o ControlMaster=auto"
+        f" -o ControlPath={_control_socket_path()}"
+        " -o ControlPersist=10m"
+    )
+    cmd = ["rsync", "-az", "-e", ssh_cmd, src, dst]
     if verbose:
         cmd.append("-v")
 

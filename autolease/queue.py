@@ -154,40 +154,38 @@ class JobQueue:
         except ValueError:
             return None
 
-    def _check_remote(self, job: Job) -> str:
-        """Check remote job state. Returns 'running', 'done', or 'lost'."""
+    def _check_remote(self, job: Job) -> tuple[str, Optional[int]]:
+        """Check remote job state in a single SSH call.
+        Returns (state, exit_code) where state is 'running', 'done', or 'lost'."""
         rdir = self._remote_job_dir(job.id)
-        if job.remote_pid:
-            r = self.slurm.cfg.run(
-                f"kill -0 {job.remote_pid} 2>/dev/null && echo alive || echo dead",
-                timeout=10,
-            )
-            alive = r.stdout.strip() == "alive"
-            if alive:
-                return "running"
-
-        # Process dead — check for exit code
-        r = self.slurm.cfg.run(f"cat {rdir}/exit_code 2>/dev/null", timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            return "done"
-        return "lost"
-
-    def _read_remote_exit_code(self, job: Job) -> Optional[int]:
-        rdir = self._remote_job_dir(job.id)
-        r = self.slurm.cfg.run(f"cat {rdir}/exit_code 2>/dev/null", timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
+        pid = job.remote_pid or 0
+        # Single SSH: check PID alive, else check exit_code file, else lost
+        cmd = (
+            f"if kill -0 {pid} 2>/dev/null; then echo RUNNING; "
+            f"elif [ -s {rdir}/exit_code ]; then echo DONE:$(cat {rdir}/exit_code); "
+            f"else echo LOST; fi"
+        )
+        r = self.slurm.cfg.run(cmd, timeout=10)
+        out = r.stdout.strip()
+        if out == "RUNNING":
+            return "running", None
+        if out.startswith("DONE:"):
             try:
-                return int(r.stdout.strip())
+                return "done", int(out.split(":", 1)[1].strip())
             except ValueError:
-                pass
-        return None
+                return "done", None
+        return "lost", None
 
     def read_log(self, job_id: int, stream: str = "stdout",
-                 tail: Optional[int] = None) -> str:
-        """Read stdout or stderr from remote."""
+                 tail: Optional[int] = None,
+                 byte_offset: int = 0) -> str:
+        """Read stdout, stderr, or combined from remote.
+        byte_offset: skip first N bytes (for incremental reads)."""
         rdir = self._remote_job_dir(job_id)
         if tail:
             cmd = f"tail -n {tail} {rdir}/{stream} 2>/dev/null"
+        elif byte_offset > 0:
+            cmd = f"tail -c +{byte_offset + 1} {rdir}/{stream} 2>/dev/null"
         else:
             cmd = f"cat {rdir}/{stream} 2>/dev/null"
         r = self.slurm.cfg.run(cmd, timeout=10)
@@ -252,19 +250,23 @@ class JobQueue:
         self.dispatch()
         return job
 
-    def get(self, job_id: int) -> Optional[Job]:
-        """Get a job, refreshing its state if running. Also dispatches pending jobs."""
+    def get(self, job_id: int, refresh: bool = True,
+            dispatch: bool = True) -> Optional[Job]:
+        """Get a job. By default refreshes running state (1 SSH) and dispatches
+        pending jobs. Pass refresh=False / dispatch=False to skip SSH calls."""
         job = self._load_job(job_id)
-        if job and job.state == "running":
+        if refresh and job and job.state == "running":
             self._refresh_running(job)
-        self.dispatch()
-        return self._load_job(job_id)  # re-read in case dispatch changed it
+        if dispatch:
+            self.dispatch()
+            job = self._load_job(job_id)  # re-read in case dispatch changed it
+        return job
 
     def _refresh_running(self, job: Job):
-        """Update a running job's state from remote."""
-        remote_state = self._check_remote(job)
+        """Update a running job's state from remote (1 SSH call)."""
+        remote_state, exit_code = self._check_remote(job)
         if remote_state == "done":
-            job.exit_code = self._read_remote_exit_code(job)
+            job.exit_code = exit_code
             job.state = "done"
             job.finished = _now()
             self._save_job(job)
@@ -289,16 +291,20 @@ class JobQueue:
         return False
 
     def list_jobs(self, project: Optional[str] = None,
-                  active_only: bool = False) -> list[Job]:
-        """List jobs, optionally filtered by project. Also dispatches pending."""
+                  active_only: bool = False,
+                  refresh: bool = True,
+                  dispatch: bool = True) -> list[Job]:
+        """List jobs, optionally filtered by project.
+        refresh=True: check remote state of each running job (1 SSH per job).
+        dispatch=True: also dispatch queued jobs (extra SSH if queue non-empty)."""
         jobs = self._all_jobs()
-        # Refresh running jobs
-        for j in jobs:
-            if j.state == "running":
-                self._refresh_running(j)
-        self.dispatch()
-        # Re-read after dispatch
-        jobs = self._all_jobs()
+        if refresh:
+            for j in jobs:
+                if j.state == "running":
+                    self._refresh_running(j)
+        if dispatch:
+            self.dispatch()
+            jobs = self._all_jobs()
         if project:
             jobs = [j for j in jobs if j.project == project]
         if active_only:
@@ -340,21 +346,33 @@ class JobQueue:
             f"project={victim.project}) on {old_node} — re-queued"
         )
 
-    def dispatch(self):
+    def dispatch(self, leases: Optional[list] = None,
+                 skip_running_refresh: bool = False):
         """Try to dispatch queued jobs to free lease slots.
         Higher priority jobs dispatch first. If no free slot,
-        a higher-priority job can preempt a lower-priority running job."""
-        from .pool import Pool
-        pool = Pool(self.config)
-        leases = pool.refresh()
+        a higher-priority job can preempt a lower-priority running job.
+
+        leases: already-refreshed leases (skips the pool.refresh() SSH call)
+        skip_running_refresh: skip _refresh_running per job (saves 1 SSH per job)
+        """
+        # Fast path: no queued jobs, no work to do → skip all SSH calls
+        queued_quick = [j for j in self._all_jobs() if j.state == "queued"]
+        if not queued_quick:
+            return
+
+        if leases is None:
+            from .pool import Pool
+            pool = Pool(self.config)
+            leases = pool.refresh()
 
         all_jobs = self._all_jobs()
         running = [j for j in all_jobs if j.state == "running"]
 
-        # Refresh running jobs first — free up slots for finished ones
-        for j in running:
-            self._refresh_running(j)
-        running = [j for j in self._all_jobs() if j.state == "running"]
+        if not skip_running_refresh:
+            # Refresh running jobs first — free up slots for finished ones
+            for j in running:
+                self._refresh_running(j)
+            running = [j for j in self._all_jobs() if j.state == "running"]
 
         queued = [j for j in self._all_jobs() if j.state == "queued"]
         if not queued:
