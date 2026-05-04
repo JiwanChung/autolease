@@ -221,7 +221,8 @@ autolease/
 - **Lease discovery**: `refresh()` scans `squeue` in a single SSH call and adopts any autolease-named jobs not in local state.
 - **Partition discovery**: partitions, GPU types, and QoS lists are auto-discovered from `scontrol show partition` + `sinfo`.
 - **SSH connection reuse**: every `ssh` and `rsync` autolease runs goes through an OpenSSH ControlMaster connection (socket at `$XDG_RUNTIME_DIR/autolease-cm-%C`, 10-minute persistence). The first call establishes a TCP/auth handshake; subsequent calls multiplex over the same connection (~5ms each). The TUI refresh, `autolease poll`, and concurrent commands all share one connection per cluster.
-- **Per-job SSH cost**: `_check_remote` checks PID liveness and exit code in one combined shell command (1 SSH per running job, not 2–3). The dispatcher short-circuits before any SSH calls when the queue is empty.
+- **Per-job SSH cost**: `_check_remote` checks PID liveness and exit code in one combined shell command (1 SSH per running job, not 2–3). It uses `/bin/sh` explicitly so it works regardless of the user's login shell on the cluster (fish/zsh/bash). On any SSH failure or unrecognized output, the job state is left untouched — autolease never marks a job as failed unless it can positively confirm the PID is gone with no exit code file. The dispatcher short-circuits before any SSH calls when the queue is empty.
+- **Output capture**: each job writes three files on the remote — `stdout`, `stderr`, and `combined`. The combined file is the real-time interleaving of both streams (via bash process substitution + `tee`), used by `autolease poll` so you see output in the same chronological order a normal terminal would show it.
 
 ## License
 

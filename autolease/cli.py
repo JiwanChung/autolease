@@ -313,10 +313,15 @@ def cmd_wait(args):
 
 
 def _do_poll(q: JobQueue, job_id: int, interval: float = 10.0, tail_n: int = 30):
-    """Polling loop: tail stdout, single SSH call per cycle."""
+    """Polling loop: tail combined stdout+stderr (interleaved chronologically),
+    falling back to stdout for jobs launched before the combined-file change.
+    Single SSH call per cycle."""
     try:
         while True:
-            out = q.read_log(job_id, stream="stdout", tail=tail_n) or ""
+            out = q.read_log(job_id, stream="combined", tail=tail_n) or ""
+            if not out:
+                # Old jobs (no combined file) — fall back to stdout
+                out = q.read_log(job_id, stream="stdout", tail=tail_n) or ""
 
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()

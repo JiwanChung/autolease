@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass, asdict
@@ -139,10 +140,16 @@ class JobQueue:
         if r.returncode != 0:
             return None
 
-        # Step 2: launch with nohup, using configured shell
+        # Step 2: launch with nohup, using configured shell.
+        # tee stdout to {rdir}/stdout AND combined; tee stderr to {rdir}/stderr
+        # AND combined. The combined file gives chronological interleaving
+        # for `autolease poll`. The separate files preserve stream identity
+        # for `autolease log [--stderr]`.
         launch = (
             f"nohup bash -c '"
-            f"{srun} {sh} {rdir}/run.sh > {rdir}/stdout 2> {rdir}/stderr;"
+            f"{srun} {sh} {rdir}/run.sh"
+            f" > >(tee -a {rdir}/stdout >> {rdir}/combined)"
+            f" 2> >(tee -a {rdir}/stderr >> {rdir}/combined);"
             f" echo $? > {rdir}/exit_code"
             f"' > /dev/null 2>&1 & echo $!"
         )
@@ -156,25 +163,48 @@ class JobQueue:
 
     def _check_remote(self, job: Job) -> tuple[str, Optional[int]]:
         """Check remote job state in a single SSH call.
-        Returns (state, exit_code) where state is 'running', 'done', or 'lost'."""
+        Returns (state, exit_code). state is one of:
+          - 'running': PID is alive
+          - 'done':    PID gone, exit_code file present (exit_code may be None)
+          - 'lost':    PID gone, no exit_code file
+          - 'unknown': SSH failed or output unrecognized — DO NOT change state
+        """
+        pid = job.remote_pid
+        if not pid or pid <= 0:
+            return "unknown", None
         rdir = self._remote_job_dir(job.id)
-        pid = job.remote_pid or 0
-        # Single SSH: check PID alive, else check exit_code file, else lost
-        cmd = (
-            f"if kill -0 {pid} 2>/dev/null; then echo RUNNING; "
-            f"elif [ -s {rdir}/exit_code ]; then echo DONE:$(cat {rdir}/exit_code); "
-            f"else echo LOST; fi"
+        # Force /bin/sh to avoid login-shell incompatibilities (fish vs bash).
+        # Use unique markers so MOTD or stderr noise can't fool the parser.
+        # Use only &&/|| chains so even sh-without-`if` would work.
+        inner = (
+            f"kill -0 {pid} 2>/dev/null && echo __AL_RUN__ || "
+            f"( test -s {rdir}/exit_code && "
+            f"  echo __AL_DONE__:`cat {rdir}/exit_code` || "
+            f"  echo __AL_LOST__ )"
         )
-        r = self.slurm.cfg.run(cmd, timeout=10)
-        out = r.stdout.strip()
-        if out == "RUNNING":
-            return "running", None
-        if out.startswith("DONE:"):
-            try:
-                return "done", int(out.split(":", 1)[1].strip())
-            except ValueError:
-                return "done", None
-        return "lost", None
+        cmd = f"/bin/sh -c {shlex.quote(inner)}"
+        try:
+            r = self.slurm.cfg.run(cmd, timeout=10)
+        except Exception:
+            return "unknown", None
+        if r.returncode != 0:
+            return "unknown", None
+        # Scan all output lines for a marker — tolerate MOTD, warnings, etc.
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line == "__AL_RUN__":
+                return "running", None
+            if line.startswith("__AL_DONE__:"):
+                code_str = line.split(":", 1)[1].strip()
+                try:
+                    return "done", int(code_str)
+                except ValueError:
+                    return "done", None
+            if line == "__AL_LOST__":
+                return "lost", None
+        # No marker found — SSH succeeded but output is unrecognized.
+        # DO NOT mark the job as anything.
+        return "unknown", None
 
     def read_log(self, job_id: int, stream: str = "stdout",
                  tail: Optional[int] = None,
@@ -263,7 +293,10 @@ class JobQueue:
         return job
 
     def _refresh_running(self, job: Job):
-        """Update a running job's state from remote (1 SSH call)."""
+        """Update a running job's state from remote (1 SSH call).
+        On 'running' or 'unknown' (SSH error / unrecognized output), leave
+        the job state unchanged — never mark a job as failed unless we
+        positively confirmed the PID is gone with no exit_code file."""
         remote_state, exit_code = self._check_remote(job)
         if remote_state == "done":
             job.exit_code = exit_code
@@ -274,6 +307,7 @@ class JobQueue:
             job.state = "failed"
             job.finished = _now()
             self._save_job(job)
+        # 'running' or 'unknown' → no change
 
     def cancel(self, job_id: int) -> bool:
         """Cancel a queued or running job."""

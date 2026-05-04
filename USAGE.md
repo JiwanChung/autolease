@@ -150,7 +150,12 @@ autolease poll -i 5        # 5s refresh
 autolease poll $id         # explicit job ID
 ```
 
-`poll` uses one SSH call per cycle (same as `watch -n 10 autolease log $id -n 30`). Exits when the job finishes.
+`poll` reads the `combined` file written by the job — stdout and stderr are interleaved chronologically (same order they were emitted, like a normal terminal). One SSH call per cycle. Exits when the job finishes.
+
+Each running job writes three remote files under `~/.autolease/jobs/<id>/`:
+- `stdout` — stdout only (read by `autolease log`)
+- `stderr` — stderr only (read by `autolease log --stderr`)
+- `combined` — both streams, in time order (read by `autolease poll`)
 
 ## Waiting for completion
 
