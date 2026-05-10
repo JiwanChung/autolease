@@ -185,24 +185,34 @@ def load_config(path: Optional[str] = None) -> PoolConfig:
         if p.exists():
             path = str(p)
     if path is None:
-        return PoolConfig()
+        cfg = PoolConfig()
+    else:
+        with open(path) as f:
+            raw = yaml.safe_load(f) or {}
 
-    with open(path) as f:
-        raw = yaml.safe_load(f) or {}
+        qos_rules = {}
+        for name, rule in raw.get("qos", {}).items():
+            if isinstance(rule, dict):
+                qos_rules[name] = QoSRule(name=name, gpu_limit=int(rule.get("gpu_limit", 0)))
+            else:
+                qos_rules[name] = QoSRule(name=name, gpu_limit=int(rule))
 
-    qos_rules = {}
-    for name, rule in raw.get("qos", {}).items():
-        if isinstance(rule, dict):
-            qos_rules[name] = QoSRule(name=name, gpu_limit=int(rule.get("gpu_limit", 0)))
-        else:
-            qos_rules[name] = QoSRule(name=name, gpu_limit=int(rule))
+        cfg = PoolConfig(
+            ssh_host=raw.get("ssh_host", "localhost"),
+            shell=raw.get("shell", "bash"),
+            env=raw.get("env", ""),
+            env_activate=raw.get("env_activate", "micromamba run -n {env}"),
+            exclude_nodes=raw.get("exclude_nodes", []),
+            state_dir=raw.get("state_dir", str(_data_dir())),
+            qos_rules=qos_rules,
+        )
 
-    return PoolConfig(
-        ssh_host=raw.get("ssh_host", "localhost"),
-        shell=raw.get("shell", "bash"),
-        env=raw.get("env", ""),
-        env_activate=raw.get("env_activate", "micromamba run -n {env}"),
-        exclude_nodes=raw.get("exclude_nodes", []),
-        state_dir=raw.get("state_dir", str(_data_dir())),
-        qos_rules=qos_rules,
-    )
+    # Environment variable overrides (take precedence over config file)
+    if os.environ.get("AUTOLEASE_SSH_HOST"):
+        cfg.ssh_host = os.environ["AUTOLEASE_SSH_HOST"]
+    if os.environ.get("AUTOLEASE_SHELL"):
+        cfg.shell = os.environ["AUTOLEASE_SHELL"]
+    if os.environ.get("AUTOLEASE_ENV"):
+        cfg.env = os.environ["AUTOLEASE_ENV"]
+
+    return cfg

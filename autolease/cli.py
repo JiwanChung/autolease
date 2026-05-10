@@ -383,6 +383,46 @@ def cmd_redo(args):
         _do_poll(q, new_job.id)
 
 
+def cmd_recover(args):
+    """Re-check jobs marked failed/done. If the wrapper is still alive on
+    the cluster (transient SSH glitch caused a wrong LOST), restore state
+    to running. Local-only: never touches the remote process."""
+    cfg = load_config(args.config)
+    q = JobQueue(cfg)
+    targets = []
+    if args.job_id is not None:
+        j = q._load_job(args.job_id)
+        if j is None:
+            print(f"Job {args.job_id} not found.", file=sys.stderr)
+            sys.exit(1)
+        targets = [j]
+    else:
+        targets = [j for j in q._all_jobs()
+                   if j.state == "failed" and j.exit_code is None
+                   and j.remote_pid]
+    if not targets:
+        print("No jobs to recover (none are marked failed with exit_code=None).",
+              file=sys.stderr)
+        return
+    for j in targets:
+        state, code = q._check_remote(j)
+        if state == "running":
+            j.state = "running"
+            j.finished = None
+            j.exit_code = None
+            q._save_job(j)
+            print(f"  job {j.id}: recovered (wrapper PID {j.remote_pid} still alive)")
+        elif state == "done":
+            j.state = "done"
+            j.exit_code = code
+            q._save_job(j)
+            print(f"  job {j.id}: actually done (exit {code})")
+        elif state == "lost":
+            print(f"  job {j.id}: confirmed lost (PID gone, no exit_code, output quiet)")
+        else:
+            print(f"  job {j.id}: SSH check returned {state} — leaving alone")
+
+
 def cmd_ssh_reset(args):
     """Tear down any ControlMaster connection to ssh_host.
     Use when ssh hangs after a network blip / cluster reboot."""
@@ -640,6 +680,11 @@ def main():
     sub.add_parser("ssh-reset",
                    help="Tear down stale SSH ControlMaster sockets (use after network blips)")
 
+    recover_p = sub.add_parser("recover",
+                               help="Re-check failed jobs to rescue ones whose wrapper is actually still alive")
+    recover_p.add_argument("job_id", type=int, nargs="?", default=None,
+                           help="Specific job (default: all failed jobs with no exit_code)")
+
     args = p.parse_args()
 
     # Load config (local only — no SSH)
@@ -681,6 +726,7 @@ def main():
         "nodes": cmd_nodes,
         "partitions": cmd_partitions,
         "ssh-reset": cmd_ssh_reset,
+        "recover": cmd_recover,
     }
     cmds[args.cmd](args)
 

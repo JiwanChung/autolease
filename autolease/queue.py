@@ -145,12 +145,15 @@ class JobQueue:
         # AND combined. The combined file gives chronological interleaving
         # for `autolease poll`. The separate files preserve stream identity
         # for `autolease log [--stderr]`.
+        # Capture exit code, then `wait` for the tee subshells to flush their
+        # buffers before writing exit_code — otherwise a few KB of in-flight
+        # output can land AFTER autolease has already marked the job done.
         launch = (
             f"nohup bash -c '"
             f"{srun} {sh} {rdir}/run.sh"
             f" > >(tee -a {rdir}/stdout >> {rdir}/combined)"
             f" 2> >(tee -a {rdir}/stderr >> {rdir}/combined);"
-            f" echo $? > {rdir}/exit_code"
+            f" __EC=$?; wait; echo $__EC > {rdir}/exit_code"
             f"' > /dev/null 2>&1 & echo $!"
         )
         r = self.slurm.cfg.run(launch, timeout=10)
@@ -164,10 +167,15 @@ class JobQueue:
     def _check_remote(self, job: Job) -> tuple[str, Optional[int]]:
         """Check remote job state in a single SSH call.
         Returns (state, exit_code). state is one of:
-          - 'running': PID is alive
+          - 'running': PID alive, OR PID gone but combined/stdout still being
+                       written (handles user scripts that detach background
+                       work after the wrapper exits)
           - 'done':    PID gone, exit_code file present (exit_code may be None)
-          - 'lost':    PID gone, no exit_code file
+          - 'lost':    PID gone, no exit_code file, AND output files quiet
+                       (no writes in the last 60s)
           - 'unknown': SSH failed or output unrecognized — DO NOT change state
+        Combines liveness check, exit_code read, AND mtime check into one
+        SSH call to keep the cost at 1 round-trip.
         """
         pid = job.remote_pid
         if not pid or pid <= 0:
@@ -175,12 +183,19 @@ class JobQueue:
         rdir = self._remote_job_dir(job.id)
         # Force /bin/sh to avoid login-shell incompatibilities (fish vs bash).
         # Use unique markers so MOTD or stderr noise can't fool the parser.
-        # Use only &&/|| chains so even sh-without-`if` would work.
+        # Output one of:
+        #   __AL_RUN__
+        #   __AL_DONE__:<code>
+        #   __AL_PIDGONE__:<combined_mtime_unix>
+        # The mtime lets us tell "wrapper exited but output still flowing"
+        # apart from "actually lost" — e.g. user scripts that nohup
+        # background work after the wrapper returns.
         inner = (
             f"kill -0 {pid} 2>/dev/null && echo __AL_RUN__ || "
             f"( test -s {rdir}/exit_code && "
             f"  echo __AL_DONE__:`cat {rdir}/exit_code` || "
-            f"  echo __AL_LOST__ )"
+            f"  echo __AL_PIDGONE__:`stat -c %Y {rdir}/combined 2>/dev/null "
+            f"  || stat -c %Y {rdir}/stdout 2>/dev/null || echo 0` )"
         )
         cmd = f"/bin/sh -c {shlex.quote(inner)}"
         try:
@@ -200,7 +215,21 @@ class JobQueue:
                     return "done", int(code_str)
                 except ValueError:
                     return "done", None
-            if line == "__AL_LOST__":
+            if line.startswith("__AL_PIDGONE__:"):
+                # PID is gone and there's no exit_code file. But maybe the
+                # user's script detached background work that's still writing
+                # output. If the output file mtime is recent, treat as still
+                # running. Otherwise, it's truly lost.
+                mtime_str = line.split(":", 1)[1].strip()
+                try:
+                    mtime = int(mtime_str)
+                except ValueError:
+                    mtime = 0
+                if mtime > 0:
+                    import time as _time
+                    age = _time.time() - mtime
+                    if age < 60:  # written in last minute → still alive
+                        return "running", None
                 return "lost", None
         # No marker found — SSH succeeded but output is unrecognized.
         # DO NOT mark the job as anything.
