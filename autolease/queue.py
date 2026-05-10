@@ -209,24 +209,30 @@ class JobQueue:
             f"wait\n"
             f"echo $__EC > {rdir}/exit_code\n"
         )
-        # One SSH round-trip: mkdir, write both scripts, chmod, launch.
-        # Use unique heredoc terminators so no user content can collide.
-        setup_and_launch = (
-            f"mkdir -p {rdir} && "
+        # Single SSH: setup + launch. CRITICAL: statements must be separated
+        # by newlines (not `&&`). With `&&`, the trailing `&` backgrounds the
+        # WHOLE pipeline in a subshell that holds the SSH channel's FDs,
+        # which makes SSH block until the launched job finishes. With
+        # newlines, `&` applies only to the immediately preceding command
+        # (the nohup), so SSH disconnects right after `echo $!`.
+        # We also use `< /dev/null` on the nohup to fully detach stdin.
+        cmd = (
+            f"mkdir -p {rdir}\n"
             f"cat > {rdir}/run.sh << '__AUTOLEASE_RUN_EOF__'\n"
             f"{cd_prefix}{job.command}\n"
             f"__AUTOLEASE_RUN_EOF__\n"
             f"cat > {rdir}/launch.sh << '__AUTOLEASE_LAUNCH_EOF__'\n"
             f"{launch_script}"
             f"__AUTOLEASE_LAUNCH_EOF__\n"
-            f"chmod +x {rdir}/run.sh {rdir}/launch.sh && "
-            f"nohup bash {rdir}/launch.sh > /dev/null 2>&1 & echo $!"
+            f"chmod +x {rdir}/run.sh {rdir}/launch.sh\n"
+            f"nohup bash {rdir}/launch.sh > /dev/null 2>&1 < /dev/null &\n"
+            f"echo $!"
         )
-        r = self.slurm.cfg.run(setup_and_launch, timeout=10)
+        r = self.slurm.cfg.run(cmd, timeout=10)
         if r.returncode != 0 or not r.stdout.strip():
             return None
         try:
-            # Output may include heredoc echoes — last line is `echo $!`
+            # Last line is the echoed PID
             login_pid = int(r.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             return None

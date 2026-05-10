@@ -56,9 +56,29 @@ autolease log --stderr # read stderr
 autolease status       # one-word state
 autolease cancel       # kill it
 autolease redo         # re-submit the same command
+autolease info         # full dump: state, lease, files, history, log tail
 ```
 
 The env var is per-shell. A different terminal has its own `AUTOLEASE_JOB_ID`. If the var isn't set, these commands fail with a helpful message — they never fall back to some "recent" global job.
+
+**Shortcut: install shell helpers** so the env var capture happens automatically:
+
+```bash
+# bash / zsh — add to .bashrc / .zshrc
+eval "$(autolease shell-init bash)"
+```
+
+```fish
+# fish — add to ~/.config/fish/config.fish
+autolease shell-init fish | source
+```
+
+Then use `al-run` instead of `autolease run`:
+
+```bash
+al-run -- python train.py    # AUTOLEASE_JOB_ID gets set automatically
+autolease poll               # uses it
+```
 
 ### Resource requirements
 

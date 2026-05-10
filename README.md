@@ -91,13 +91,31 @@ exclude_nodes:
 qos:
   base_qos: 8       # guaranteed, non-preemptible
   pro6000_qos: 4
+
+# Optional: tunables (defaults shown)
+tunables:
+  tui_refresh_interval: 30.0    # TUI background refresh, seconds
+  poll_interval: 10.0           # `autolease poll` cycle, seconds
+  poll_tail_lines: 30           # initial lines on each poll cycle
+  ssh_timeout: 10               # per-SSH-call timeout
+  mtime_threshold: 60           # output-file recency for liveness check
+  discovery_cache_seconds: 300  # how long to cache scontrol/sinfo
 ```
 
 Partitions, GPU types, and allowed QoS lists are auto-discovered from the cluster via `scontrol`. VRAM is a built-in lookup table. You only need to declare QoS limits that affect your strategy.
 
 The `shell` setting controls which shell runs your commands on GPU nodes. Set it to match whatever shell has your conda/micromamba/module setup.
 
-State and job data are stored in `~/.local/share/autolease/`.
+State and job data are stored in `~/.local/share/autolease/`. Per-job event history goes in `<state>/jobs/<id>.history` (append-only timestamped log of state transitions).
+
+### Environment variable overrides
+
+| Variable | Overrides |
+|---|---|
+| `AUTOLEASE_SSH_HOST` | `ssh_host` (per-shell cluster switching) |
+| `AUTOLEASE_SHELL` | `shell` |
+| `AUTOLEASE_ENV` | `env` |
+| `AUTOLEASE_JOB_ID` | Default job ID for `poll`/`log`/`status`/`cancel`/`redo`/`info` |
 
 ## CLI reference
 
@@ -117,18 +135,20 @@ State and job data are stored in `~/.local/share/autolease/`.
 
 ### Job queue
 
-All job commands accept an optional job ID. If omitted, they read `AUTOLEASE_JOB_ID` from the environment, or fall back to the last submitted job.
+Most job commands accept an optional job ID. If omitted, they read `AUTOLEASE_JOB_ID` from the environment. `status` and `cancel` accept multiple IDs.
 
 | Command | Description |
 |---|---|
 | `autolease run [opts] -- <command>` | Submit a job (prints job ID to stdout) |
 | `autolease poll [id] [-i SECS]` | Tail stdout, refreshing periodically (default: 10s) |
-| `autolease status [id] [--json]` | One-word state: `queued`, `running`, `done:0`, `failed` |
+| `autolease status [id ...] [--json]` | One-word state per job: `queued`, `running`, `done:0`, `failed` |
 | `autolease jobs [project] [-a]` | List jobs, optionally filtered by project |
 | `autolease log [id] [--stderr] [-n LINES]` | Read job output |
 | `autolease wait <id>` | Block until done, print output, exit with job's code |
-| `autolease cancel [id]` | Kill a queued or running job |
+| `autolease cancel [id ...]` | Kill queued or running jobs |
 | `autolease redo [id] [--poll]` | Re-submit the same command as a previous job |
+| `autolease info [id ...] [-n LINES] [--no-log]` | One-shot dump: state, lease, files, history, log tail |
+| `autolease recover [id]` | Re-check failed jobs whose wrapper might still be alive (rescues false-LOST verdicts) |
 
 **`run` options:**
 
@@ -161,7 +181,33 @@ Code files (`*.py`, `*.yaml`, `*.sh`, etc.) are auto-synced before each `run`. R
 | Command | Description |
 |---|---|
 | `autolease nodes` | Show all cluster nodes with GPU type, count, state |
-| `autolease partitions` | Show partition/QoS/VRAM reference table |
+| `autolease partitions [--refresh]` | Show partition/QoS/VRAM reference table. `--refresh` busts the discovery cache. |
+
+### Shell helpers
+
+| Command | Description |
+|---|---|
+| `autolease shell-init <bash\|zsh\|fish>` | Print `al-run` / `al-redo` shell functions for sourcing — they wrap `autolease run/redo` and capture the printed job ID into `AUTOLEASE_JOB_ID` for the current shell |
+
+Add to your shell rc file:
+
+```bash
+# bash / zsh
+eval "$(autolease shell-init bash)"
+```
+
+```fish
+# fish
+autolease shell-init fish | source
+```
+
+Then:
+
+```bash
+al-run -- python train.py    # AUTOLEASE_JOB_ID gets set automatically
+autolease poll               # uses AUTOLEASE_JOB_ID
+autolease info               # ditto
+```
 
 ### TUI
 
@@ -213,16 +259,19 @@ autolease/
 ```
 
 - **Leases** are `sbatch --wrap 'sleep infinity'` jobs. Work runs inside them via `srun --jobid --overlap`.
-- **Jobs** execute on the remote via `nohup srun ... &`, surviving SSH disconnects. Output is written to `~/.autolease/jobs/<id>/` on the cluster.
+- **Jobs** execute on the remote via `nohup bash launch.sh &`, where `launch.sh` is generated on disk per job (under `~/.autolease/jobs/<id>/launch.sh` on the cluster — readable for debugging). The launcher invokes `srun --jobid=<lease> --overlap --job-name=autolease-job-<id>` and tees output to `stdout`/`stderr`/`combined` files.
+- **Liveness check** uses Slurm as the source of truth: `squeue -s -j <lease>` lists active steps; we look up our step by `--job-name`. The login-node wrapper PID is *not* trusted — it can die for unrelated reasons (login-node reboot, network blip, ControlMaster wedge) while the actual work continues on the compute node.
+- **Schema versioning**: each job JSON has `schema_version`; `_migrate_job_dict` upgrades old files on load, idempotently.
+- **Per-job history**: `~/.local/share/autolease/jobs/<id>.history` is an append-only timestamped log of state transitions (SUBMIT, DISPATCH, PREEMPT, DONE, LOST, CANCEL, RECOVER). Local-only writes — zero SSH cost. Surfaced via `autolease info`.
 - **State** is local JSON files. No database, no daemon.
-- **Dispatch** is opportunistic: write-path commands (`run`, `cancel`, `up`, `down`) and the TUI refresh dispatch pending jobs. Read-only commands (`status`, `log`, `jobs`) never dispatch — they only do the SSH calls they actually need. Jobs prefer the smallest VRAM lease that fits.
+- **Dispatch** is opportunistic: write-path commands (`run`, `cancel`, `up`, `down`) and the TUI refresh dispatch pending jobs. Read-only commands (`status`, `log`, `jobs`, `info`) never dispatch — they only do the SSH calls they actually need. Jobs prefer the smallest VRAM lease that fits.
 - **Priority preemption**: when a high-priority job has no free lease, it preempts the lowest-priority running job on a matching lease. The victim is re-queued. All events are logged.
 - **Code sync**: rsync with an allowlist of code file extensions. Only newer files are transferred. Remote path mirrors local `~/` structure.
 - **Env activation**: commands are wrapped with `env_activate` template (e.g. `micromamba run -n dl <command>`).
 - **Lease discovery**: `refresh()` scans `squeue` in a single SSH call and adopts any autolease-named jobs not in local state.
-- **Partition discovery**: partitions, GPU types, and QoS lists are auto-discovered from `scontrol show partition` + `sinfo`.
-- **SSH connection reuse**: every `ssh` and `rsync` autolease runs goes through an OpenSSH ControlMaster connection (socket at `$XDG_RUNTIME_DIR/autolease-cm-%C`, 10-minute persistence). The first call establishes a TCP/auth handshake; subsequent calls multiplex over the same connection (~5ms each). The TUI refresh, `autolease poll`, and concurrent commands all share one connection per cluster.
-- **Per-job SSH cost**: `_check_remote` checks PID liveness and exit code in one combined shell command (1 SSH per running job, not 2–3). It uses `/bin/sh` explicitly so it works regardless of the user's login shell on the cluster (fish/zsh/bash). On any SSH failure or unrecognized output, the job state is left untouched — autolease never marks a job as failed unless it can positively confirm the PID is gone with no exit code file. The dispatcher short-circuits before any SSH calls when the queue is empty.
+- **Partition discovery**: partitions, GPU types, and QoS lists are auto-discovered from `scontrol show partition` + `sinfo`. Cached locally for `discovery_cache_seconds` (default 5 min) to avoid hammering the cluster on every CLI invocation.
+- **SSH connection reuse**: every `ssh` and `rsync` autolease runs goes through an OpenSSH ControlMaster connection (socket at `$XDG_RUNTIME_DIR/autolease-cm-%C`, 10-minute persistence). The first call establishes a TCP/auth handshake; subsequent calls multiplex over the same connection (~5ms each). On a stale-socket timeout, autolease recovers automatically — tear down the master, retry once with a fresh one. Manual cleanup: `autolease ssh-reset`.
+- **Per-job SSH cost**: `_check_remote` is one SSH call: `[ -s exit_code ]` → done; `squeue -s -j LEASE` lists our step → running; otherwise check output mtime → running if recent (handles user scripts that detached background work) else lost. On any SSH failure or unrecognized output, the job state is left untouched — autolease never marks a job as failed unless it can positively confirm the step is gone, the exit_code file is absent, and the output files have been quiet for `mtime_threshold` seconds. The dispatcher short-circuits before any SSH calls when the queue is empty.
 - **Output capture**: each job writes three files on the remote — `stdout`, `stderr`, and `combined`. The combined file is the real-time interleaving of both streams (via bash process substitution + `tee`), used by `autolease poll` so you see output in the same chronological order a normal terminal would show it.
 
 ## Tests

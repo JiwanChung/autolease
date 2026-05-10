@@ -135,3 +135,55 @@ class TestCheckRemoteLegacyPath:
         q, stub = queue_with_stub
         job = _make_job(1, step_name=None, remote_pid=None)
         assert q._check_remote(job) == ("unknown", None)
+
+
+class TestLaunchRemoteShellStructure:
+    """Regression tests for the launch SSH command structure.
+    Catches the bug where chaining `&&` with `&` backgrounded the entire
+    pipeline in a subshell that held SSH FDs, making submit hang."""
+
+    def test_launch_uses_newlines_not_ampamp_chain(self, cfg):
+        """The setup statements must be on separate lines so that the
+        trailing `&` only backgrounds the nohup. With `&&`, `cmd1 && cmd2 &`
+        backgrounds the whole pipeline in a subshell."""
+        from autolease.queue import JobQueue
+        from autolease.slurm import Lease
+        captured = {}
+
+        class CapturingCfg:
+            ssh_host = "stub-host"
+            shell = "bash"
+            ssh_opts = ()
+
+            def run(self, cmd, timeout=30):
+                captured["cmd"] = cmd
+                # Return a PID so launch_remote thinks it succeeded
+                return StubResponse([cmd], 0, "12345\n", "")
+
+        q = JobQueue(cfg)
+        q.slurm.cfg = CapturingCfg()
+        from autolease.queue import Job
+        job = Job(id=42, project="p", command="echo x", state="queued",
+                  num_gpus=1, remote_cwd="~/x")
+        lease = Lease(job_id=999, partition="p", qos="q", gpu_type="A100",
+                      num_gpus=1, node="n", state="RUNNING")
+        result = q._launch_remote(job, lease)
+        assert result is not None
+        assert result[0] == 12345  # PID
+        # The command must NOT chain the chmod/setup with && to the nohup line.
+        # `cmd1 && cmd2 &` backgrounds the whole pipeline in a subshell that
+        # holds the SSH FDs; `cmd1\ncmd2 &` backgrounds only cmd2.
+        cmd = captured["cmd"]
+        assert "chmod +x" in cmd
+        assert "nohup bash" in cmd
+        # Find the line containing nohup; chmod must NOT be on the same line.
+        nohup_line = next(line for line in cmd.split("\n") if "nohup bash" in line)
+        assert "chmod" not in nohup_line, \
+            f"chmod must be on its own line, not chained on the nohup line: {nohup_line!r}"
+        assert "&&" not in nohup_line.split("nohup")[0], \
+            "must not have `... && nohup &` pattern"
+        # nohup must be backgrounded
+        assert nohup_line.rstrip().endswith("&"), \
+            f"nohup line must end with `&`: {nohup_line!r}"
+        # Must redirect stdout/stderr/stdin so SSH disconnects immediately
+        assert "/dev/null" in nohup_line
