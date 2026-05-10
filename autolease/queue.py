@@ -28,7 +28,11 @@ class Job:
     remote_cwd: Optional[str] = None  # remote dir to cd into before running
     exit_code: Optional[int] = None
     lease_job_id: Optional[int] = None
-    remote_pid: Optional[int] = None
+    remote_pid: Optional[int] = None  # legacy: login-node wrapper PID (kept
+                                      # for in-flight jobs launched before
+                                      # the wrapperless refactor)
+    step_name: Optional[str] = None  # srun --job-name marker, used as the
+                                     # canonical liveness handle via squeue
     node: Optional[str] = None
     submitted: Optional[str] = None
     started: Optional[str] = None
@@ -99,6 +103,7 @@ class JobQueue:
             d = json.load(f)
         d.setdefault("priority", 0)
         d.setdefault("remote_cwd", None)
+        d.setdefault("step_name", None)
         return Job(**d)
 
     def _all_jobs(self) -> list[Job]:
@@ -110,6 +115,8 @@ class JobQueue:
                     with open(os.path.join(self._jobs_dir, fname)) as f:
                         d = json.load(f)
                     d.setdefault("priority", 0)
+                    d.setdefault("remote_cwd", None)
+                    d.setdefault("step_name", None)
                     jobs.append(Job(**d))
                 except (json.JSONDecodeError, TypeError):
                     continue
@@ -121,13 +128,32 @@ class JobQueue:
     def _remote_job_dir(self, job_id: int) -> str:
         return f"~/.autolease/jobs/{job_id}"
 
-    def _launch_remote(self, job: Job, lease: Lease) -> Optional[int]:
-        """Write script to remote, launch via nohup srun, return remote PID."""
+    def _step_name(self, job: Job) -> str:
+        """Slurm step name used as the canonical liveness handle."""
+        return f"autolease-job-{job.id}"
+
+    def _launch_remote(self, job: Job, lease: Lease) -> Optional[tuple[int, str]]:
+        """Write script to remote, launch via nohup srun.
+        The login-node `nohup bash` is intentionally minimal — it only exists
+        to detach from SSH and to stage tee for chronological log interleaving.
+        Liveness is tracked via the srun job-step's name (squeue --steps), not
+        the wrapper PID. Returns (login_pid, step_name) for backward-compat
+        and future cancel/kill operations."""
         rdir = self._remote_job_dir(job.id)
         sh = self.slurm.cfg.shell
-        srun = f"srun --jobid={lease.job_id} --gres=gpu:{job.num_gpus} --overlap"
+        step_name = self._step_name(job)
 
-        # Step 1: write the job script to remote
+        # The srun --job-name is the canonical handle: it identifies our step
+        # within the lease via `squeue --steps --jobid={lease}`. Login-node
+        # processes can come and go (network blips, ControlMaster wedging,
+        # login-node reboots) — Slurm always knows whether the step is alive
+        # on the compute node.
+        srun = (
+            f"srun --jobid={lease.job_id} --gres=gpu:{job.num_gpus}"
+            f" --overlap --job-name={step_name}"
+        )
+
+        # Step 1: write the job script (run on the compute node via srun)
         cd_prefix = f"cd {job.remote_cwd} && " if job.remote_cwd else ""
         setup = (
             f"mkdir -p {rdir} && "
@@ -140,14 +166,11 @@ class JobQueue:
         if r.returncode != 0:
             return None
 
-        # Step 2: launch with nohup, using configured shell.
+        # Step 2: launch.
         # tee stdout to {rdir}/stdout AND combined; tee stderr to {rdir}/stderr
-        # AND combined. The combined file gives chronological interleaving
-        # for `autolease poll`. The separate files preserve stream identity
-        # for `autolease log [--stderr]`.
-        # Capture exit code, then `wait` for the tee subshells to flush their
-        # buffers before writing exit_code — otherwise a few KB of in-flight
-        # output can land AFTER autolease has already marked the job done.
+        # AND combined. The combined file gives chronological interleaving for
+        # `autolease poll`. Exit code is captured by the bash wrapper after
+        # srun returns.
         launch = (
             f"nohup bash -c '"
             f"{srun} {sh} {rdir}/run.sh"
@@ -160,36 +183,99 @@ class JobQueue:
         if r.returncode != 0 or not r.stdout.strip():
             return None
         try:
-            return int(r.stdout.strip())
+            login_pid = int(r.stdout.strip())
         except ValueError:
             return None
+        return (login_pid, step_name)
 
     def _check_remote(self, job: Job) -> tuple[str, Optional[int]]:
         """Check remote job state in a single SSH call.
+        Slurm is the source of truth: we look up our srun job-step by name
+        within the lease. Login-node processes (the wrapper bash, ssh
+        ControlMaster, etc.) can come and go without affecting the verdict.
+
         Returns (state, exit_code). state is one of:
-          - 'running': PID alive, OR PID gone but combined/stdout still being
-                       written (handles user scripts that detach background
-                       work after the wrapper exits)
-          - 'done':    PID gone, exit_code file present (exit_code may be None)
-          - 'lost':    PID gone, no exit_code file, AND output files quiet
-                       (no writes in the last 60s)
+          - 'running': step is alive in Slurm (`squeue -s -j LEASE` lists
+                       it), OR exit_code not yet written but output files
+                       written in last 60s (handles user scripts that
+                       detached background work; the wrapper may be mid-flush)
+          - 'done':    exit_code file present (canonical signal — Slurm step
+                       may already be gone or still finalizing)
+          - 'lost':    no exit_code file AND step not in Slurm AND output
+                       files quiet for 60s+
           - 'unknown': SSH failed or output unrecognized — DO NOT change state
-        Combines liveness check, exit_code read, AND mtime check into one
-        SSH call to keep the cost at 1 round-trip.
+
+        Backward compat: if the Job has no step_name (legacy in-flight job),
+        falls back to PID-based checking via _check_remote_legacy.
         """
+        if not job.step_name:
+            return self._check_remote_legacy(job)
+        if not job.lease_job_id:
+            return "unknown", None
+
+        rdir = self._remote_job_dir(job.id)
+        step_name = job.step_name
+        lease_id = job.lease_job_id
+
+        # One SSH round-trip:
+        #   1. exit_code file present? -> __AL_DONE__:<code>
+        #   2. step in squeue?         -> __AL_RUN__
+        #   3. otherwise mtime of combined/stdout, caller decides
+        # squeue --steps --jobid=N --noheader -o "%j" lists step names.
+        # We grep -Fx (fixed-string, exact line) for our name.
+        inner = (
+            f"if [ -s {rdir}/exit_code ]; then "
+            f"  echo __AL_DONE__:`cat {rdir}/exit_code`; "
+            f"elif squeue -s -j {lease_id} --noheader -o '%j' 2>/dev/null "
+            f"     | grep -Fxq {shlex.quote(step_name)}; then "
+            f"  echo __AL_RUN__; "
+            f"else "
+            f"  echo __AL_NOSTEP__:`stat -c %Y {rdir}/combined 2>/dev/null "
+            f"    || stat -c %Y {rdir}/stdout 2>/dev/null || echo 0`; "
+            f"fi"
+        )
+        cmd = f"/bin/sh -c {shlex.quote(inner)}"
+        try:
+            r = self.slurm.cfg.run(cmd, timeout=10)
+        except Exception:
+            return "unknown", None
+        if r.returncode != 0:
+            return "unknown", None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line == "__AL_RUN__":
+                return "running", None
+            if line.startswith("__AL_DONE__:"):
+                code_str = line.split(":", 1)[1].strip()
+                try:
+                    return "done", int(code_str)
+                except ValueError:
+                    return "done", None
+            if line.startswith("__AL_NOSTEP__:"):
+                # Slurm doesn't know about our step and there's no exit_code.
+                # Could be: (a) Slurm racing — step just registered/just
+                # ended, (b) output flushing, (c) actually lost.
+                mtime_str = line.split(":", 1)[1].strip()
+                try:
+                    mtime = int(mtime_str)
+                except ValueError:
+                    mtime = 0
+                if mtime > 0:
+                    import time as _time
+                    if _time.time() - mtime < 60:
+                        return "running", None
+                return "lost", None
+        return "unknown", None
+
+    def _check_remote_legacy(self, job: Job) -> tuple[str, Optional[int]]:
+        """Legacy PID-based check for jobs launched before the step_name
+        refactor. Same logic as the old _check_remote: use kill -0 + mtime
+        defensive fallback. Once these in-flight jobs finish, this path
+        won't be exercised again."""
         pid = job.remote_pid
         if not pid or pid <= 0:
             return "unknown", None
         rdir = self._remote_job_dir(job.id)
-        # Force /bin/sh to avoid login-shell incompatibilities (fish vs bash).
-        # Use unique markers so MOTD or stderr noise can't fool the parser.
-        # Output one of:
-        #   __AL_RUN__
-        #   __AL_DONE__:<code>
-        #   __AL_PIDGONE__:<combined_mtime_unix>
-        # The mtime lets us tell "wrapper exited but output still flowing"
-        # apart from "actually lost" — e.g. user scripts that nohup
-        # background work after the wrapper returns.
         inner = (
             f"kill -0 {pid} 2>/dev/null && echo __AL_RUN__ || "
             f"( test -s {rdir}/exit_code && "
@@ -204,7 +290,6 @@ class JobQueue:
             return "unknown", None
         if r.returncode != 0:
             return "unknown", None
-        # Scan all output lines for a marker — tolerate MOTD, warnings, etc.
         for line in r.stdout.splitlines():
             line = line.strip()
             if line == "__AL_RUN__":
@@ -216,10 +301,6 @@ class JobQueue:
                 except ValueError:
                     return "done", None
             if line.startswith("__AL_PIDGONE__:"):
-                # PID is gone and there's no exit_code file. But maybe the
-                # user's script detached background work that's still writing
-                # output. If the output file mtime is recent, treat as still
-                # running. Otherwise, it's truly lost.
                 mtime_str = line.split(":", 1)[1].strip()
                 try:
                     mtime = int(mtime_str)
@@ -227,12 +308,9 @@ class JobQueue:
                     mtime = 0
                 if mtime > 0:
                     import time as _time
-                    age = _time.time() - mtime
-                    if age < 60:  # written in last minute → still alive
+                    if _time.time() - mtime < 60:
                         return "running", None
                 return "lost", None
-        # No marker found — SSH succeeded but output is unrecognized.
-        # DO NOT mark the job as anything.
         return "unknown", None
 
     def read_log(self, job_id: int, stream: str = "stdout",
@@ -251,12 +329,35 @@ class JobQueue:
         return r.stdout
 
     def _kill_remote(self, job: Job):
-        """Kill a running remote job."""
-        if job.remote_pid:
-            self.slurm.cfg.run(
-                f"kill {job.remote_pid} 2>/dev/null; kill -9 {job.remote_pid} 2>/dev/null",
-                timeout=10,
+        """Kill a running remote job. Uses scancel on the Slurm step (the
+        canonical kill path — survives login-node weirdness, terminates the
+        compute-node work cleanly), then SIGKILLs the login-node wrapper as
+        a backup. For legacy jobs (no step_name), only the PID kill applies."""
+        if job.step_name and job.lease_job_id:
+            # Find the step ID by name within our lease, then scancel it.
+            # `scancel` doesn't support --name filtering across all jobs in a
+            # way that works for steps, so we look up the step ID first.
+            inner = (
+                f"squeue -s -j {job.lease_job_id} --noheader -o '%i %j' 2>/dev/null"
+                f" | awk '$2 == {shlex.quote(job.step_name)} {{print $1; exit}}'"
             )
+            cmd = f"/bin/sh -c {shlex.quote(inner)}"
+            try:
+                r = self.slurm.cfg.run(cmd, timeout=10)
+                step_id = r.stdout.strip()
+                if step_id:
+                    self.slurm.cfg.run(f"scancel {step_id}", timeout=10)
+            except Exception:
+                pass
+        if job.remote_pid:
+            try:
+                self.slurm.cfg.run(
+                    f"kill {job.remote_pid} 2>/dev/null;"
+                    f" kill -9 {job.remote_pid} 2>/dev/null",
+                    timeout=10,
+                )
+            except Exception:
+                pass
 
     # ── Queue operations ──
 
@@ -400,6 +501,7 @@ class JobQueue:
         old_node = victim.node
         victim.state = "queued"
         victim.remote_pid = None
+        victim.step_name = None
         victim.lease_job_id = None
         victim.node = None
         victim.started = None
@@ -476,17 +578,19 @@ class JobQueue:
                     continue
                 if self._lease_is_busy(lease, running):
                     continue
-                pid = self._launch_remote(job, lease)
-                if pid:
+                result = self._launch_remote(job, lease)
+                if result:
+                    pid, step_name = result
                     job.state = "running"
                     job.remote_pid = pid
+                    job.step_name = step_name
                     job.lease_job_id = lease.job_id
                     job.node = lease.node
                     job.started = _now()
                     self._save_job(job)
                     self._log_event(
                         f"DISPATCH job {job.id} (priority={job.priority}) "
-                        f"-> {lease.node} ({lease.gpu_type})"
+                        f"-> {lease.node} ({lease.gpu_type}) step={step_name}"
                     )
                     running.append(job)
                     launched = True
@@ -522,17 +626,19 @@ class JobQueue:
             running = [r for r in running if r.id != victim.id]
 
             # Launch on freed lease
-            pid = self._launch_remote(job, lease)
-            if pid:
+            result = self._launch_remote(job, lease)
+            if result:
+                pid, step_name = result
                 job.state = "running"
                 job.remote_pid = pid
+                job.step_name = step_name
                 job.lease_job_id = lease.job_id
                 job.node = lease.node
                 job.started = _now()
                 self._save_job(job)
                 self._log_event(
                     f"DISPATCH job {job.id} (priority={job.priority}) "
-                    f"-> {lease.node} ({lease.gpu_type}) "
+                    f"-> {lease.node} ({lease.gpu_type}) step={step_name} "
                     f"[preempted job {victim.id}]"
                 )
                 running.append(job)
