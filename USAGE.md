@@ -320,8 +320,12 @@ autolease is designed to be a polite SSH client:
 - The TUI's 30-second refresh does one `squeue` + one combined-PID-check per running job + (optional) one `squeue` if there's anything to dispatch. No periodic log polling.
 - `autolease poll` does one `tail -n 30` per cycle (default 10s) and a local-only state check.
 
-To manually tear down the multiplexed connection:
+If a ControlMaster connection wedges (cluster reboot, network blip, killed master process), `autolease` detects the timeout and recovers automatically: it tears down the stale socket and retries with a fresh master. You'll see one ~10s delay on the affected call, then everything goes back to fast.
+
+To force a manual cleanup at any time:
 
 ```bash
-ssh -O exit -o ControlPath=$XDG_RUNTIME_DIR/autolease-cm-%C <host>
+autolease ssh-reset
 ```
+
+This is useful when you know the cluster just had problems and you want to skip the first slow recovery cycle.

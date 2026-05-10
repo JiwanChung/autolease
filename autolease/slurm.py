@@ -1,5 +1,6 @@
 """Low-level Slurm command wrappers. Runs commands via SSH or locally."""
 
+import glob
 import json
 import os
 import subprocess
@@ -8,13 +9,56 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+def _control_socket_dir() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.ssh")
+    os.makedirs(runtime, exist_ok=True)
+    return runtime
+
+
 def _control_socket_path() -> str:
     """Path for the shared SSH control socket.
     %C in ControlPath expands to a hash of host/port/user, so different
     clusters get different sockets automatically."""
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or os.path.expanduser("~/.ssh")
-    os.makedirs(runtime, exist_ok=True)
-    return os.path.join(runtime, "autolease-cm-%C")
+    return os.path.join(_control_socket_dir(), "autolease-cm-%C")
+
+
+def _resolve_socket_for_host(ssh_opts: tuple, host: str) -> Optional[str]:
+    """Ask ssh -G to expand %C and tell us the actual socket path for this host.
+    Returns None if it can't be determined."""
+    try:
+        r = subprocess.run(
+            ["ssh", *ssh_opts, "-G", host],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in r.stdout.splitlines():
+            if line.lower().startswith("controlpath "):
+                return os.path.expanduser(line.split(None, 1)[1].strip())
+    except Exception:
+        pass
+    return None
+
+
+def _recover_control_socket(ssh_opts: tuple, host: str) -> None:
+    """Tear down a stale ControlMaster connection. Tries graceful exit first,
+    then force-removes the socket file. Safe to call when the socket is fine
+    (graceful exit will succeed quickly) or already gone (no-op)."""
+    # Graceful exit (short timeout — if the master is wedged, this hangs).
+    try:
+        subprocess.run(
+            ["ssh", *ssh_opts, "-O", "exit", host],
+            capture_output=True, timeout=3,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        pass
+    # Force-remove the resolved socket if it's still there.
+    sock = _resolve_socket_for_host(ssh_opts, host)
+    if sock and os.path.exists(sock):
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
 
 
 @dataclass
@@ -23,20 +67,35 @@ class SlurmConfig:
     shell: str = "bash"  # remote shell for job execution
     # SSH options. ControlMaster reuses a single TCP connection across all
     # ssh invocations (massive speedup for polling/refresh loops).
+    # If a master gets wedged (stale socket after a network blip), `run`
+    # detects the timeout, calls `_recover_control_socket`, and retries.
     ssh_opts: tuple = (
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=2",
         "-o", "ControlMaster=auto",
         "-o", f"ControlPath={_control_socket_path()}",
         "-o", "ControlPersist=10m",
     )
 
     def run(self, cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
-        if self.ssh_host:
-            full = ["ssh", *self.ssh_opts, self.ssh_host, cmd]
-        else:
-            full = ["bash", "-c", cmd]
-        r = subprocess.run(full, capture_output=True, timeout=timeout)
+        if not self.ssh_host:
+            r = subprocess.run(["bash", "-c", cmd], capture_output=True, timeout=timeout)
+            return subprocess.CompletedProcess(
+                r.args, r.returncode,
+                stdout=r.stdout.decode("utf-8", errors="replace"),
+                stderr=r.stderr.decode("utf-8", errors="replace"),
+            )
+
+        full = ["ssh", *self.ssh_opts, self.ssh_host, cmd]
+        try:
+            r = subprocess.run(full, capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Likely a wedged ControlMaster (master process alive but not
+            # responding). Tear it down and retry once with a fresh master.
+            _recover_control_socket(self.ssh_opts, self.ssh_host)
+            r = subprocess.run(full, capture_output=True, timeout=timeout)
         return subprocess.CompletedProcess(
             r.args, r.returncode,
             stdout=r.stdout.decode("utf-8", errors="replace"),

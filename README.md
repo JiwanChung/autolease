@@ -113,6 +113,7 @@ State and job data are stored in `~/.local/share/autolease/`.
 | `autolease renew [-t MINUTES]` | Renew leases within N minutes of expiry (default: 30) |
 | `autolease bad-nodes [--clear]` | Show or reset the bad-node list |
 | `autolease shell [lease_id] [-g TYPE] [-n GPUs] [-s SHELL]` | Open an interactive shell on a lease via `srun --pty` |
+| `autolease ssh-reset` | Tear down stale SSH ControlMaster sockets (use after network blips or cluster reboots) |
 
 ### Job queue
 

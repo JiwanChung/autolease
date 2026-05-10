@@ -118,13 +118,17 @@ def sync(config: PoolConfig,
     exc = exclude or DEFAULT_EXCLUDE
 
     # Let rsync reuse the autolease SSH ControlMaster connection
-    from .slurm import _control_socket_path
-    ssh_cmd = (
-        "ssh -o BatchMode=yes -o ConnectTimeout=10"
-        " -o ControlMaster=auto"
-        f" -o ControlPath={_control_socket_path()}"
-        " -o ControlPersist=10m"
+    from .slurm import _control_socket_path, _recover_control_socket
+    SSH_OPTS = (
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=2",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={_control_socket_path()}",
+        "-o", "ControlPersist=10m",
     )
+    ssh_cmd = "ssh " + " ".join(SSH_OPTS)
     cmd = [
         "rsync", "-az", "--update",  # skip files newer on remote
         "-e", ssh_cmd,
@@ -153,7 +157,12 @@ def sync(config: PoolConfig,
 
     cmd.extend([src, dst])
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        # Wedged ControlMaster — recover and retry once
+        _recover_control_socket(SSH_OPTS, config.ssh_host)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode == 0 and not dry_run:
         _touch_stamp(local_dir)
     return result
@@ -178,15 +187,23 @@ def pull(config: PoolConfig,
     src = f"{config.ssh_host}:{remote_dir}/{remote_subpath}"
     dst = str(project_root / remote_subpath)
 
-    from .slurm import _control_socket_path
-    ssh_cmd = (
-        "ssh -o BatchMode=yes -o ConnectTimeout=10"
-        " -o ControlMaster=auto"
-        f" -o ControlPath={_control_socket_path()}"
-        " -o ControlPersist=10m"
+    from .slurm import _control_socket_path, _recover_control_socket
+    SSH_OPTS = (
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=2",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={_control_socket_path()}",
+        "-o", "ControlPersist=10m",
     )
+    ssh_cmd = "ssh " + " ".join(SSH_OPTS)
     cmd = ["rsync", "-az", "-e", ssh_cmd, src, dst]
     if verbose:
         cmd.append("-v")
 
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        _recover_control_socket(SSH_OPTS, config.ssh_host)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=120)

@@ -383,6 +383,34 @@ def cmd_redo(args):
         _do_poll(q, new_job.id)
 
 
+def cmd_ssh_reset(args):
+    """Tear down any ControlMaster connection to ssh_host.
+    Use when ssh hangs after a network blip / cluster reboot."""
+    from .slurm import _recover_control_socket, _control_socket_dir
+    cfg = load_config(args.config)
+    if not cfg.ssh_host:
+        print("No ssh_host configured.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Tearing down ControlMaster for {cfg.ssh_host}...", file=sys.stderr)
+    SSH_OPTS = (
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={os.path.join(_control_socket_dir(), 'autolease-cm-%C')}",
+        "-o", "ControlPersist=10m",
+    )
+    _recover_control_socket(SSH_OPTS, cfg.ssh_host)
+    # Also force-remove ALL autolease sockets in case any are stale
+    import glob
+    for sock in glob.glob(os.path.join(_control_socket_dir(), "autolease-cm-*")):
+        try:
+            os.unlink(sock)
+            print(f"  removed {sock}", file=sys.stderr)
+        except OSError:
+            pass
+    print("Done.", file=sys.stderr)
+
+
 def cmd_shell(args):
     """Open an interactive shell on a held lease via srun --pty."""
     import subprocess
@@ -609,6 +637,8 @@ def main():
                           help="Show last N events (default: 20)")
     sub.add_parser("nodes", help="Show cluster GPU nodes")
     sub.add_parser("partitions", help="Show partition/QoS map")
+    sub.add_parser("ssh-reset",
+                   help="Tear down stale SSH ControlMaster sockets (use after network blips)")
 
     args = p.parse_args()
 
@@ -650,6 +680,7 @@ def main():
         "events": cmd_events,
         "nodes": cmd_nodes,
         "partitions": cmd_partitions,
+        "ssh-reset": cmd_ssh_reset,
     }
     cmds[args.cmd](args)
 
