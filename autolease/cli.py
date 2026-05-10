@@ -200,7 +200,8 @@ def cmd_bad_nodes(args):
 # ── Job commands ──
 
 def _get_job_id(args, cfg) -> int:
-    """Get job ID from args or AUTOLEASE_JOB_ID env var."""
+    """Get a single job ID from args or AUTOLEASE_JOB_ID env var.
+    Kept for backward compat / commands that genuinely take one job."""
     jid = getattr(args, "job_id", None)
     if jid is not None:
         return jid
@@ -209,6 +210,22 @@ def _get_job_id(args, cfg) -> int:
         return int(env_id)
     print(
         "No job ID. Pass one, or set AUTOLEASE_JOB_ID in your shell:\n"
+        "  export AUTOLEASE_JOB_ID=$(autolease run -- <command>)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _get_job_ids(args, cfg) -> list[int]:
+    """Get one or more job IDs from `job_ids` (nargs='*') or env var."""
+    ids = getattr(args, "job_ids", None) or []
+    if ids:
+        return ids
+    env_id = os.environ.get("AUTOLEASE_JOB_ID")
+    if env_id:
+        return [int(env_id)]
+    print(
+        "No job ID(s). Pass one or more, or set AUTOLEASE_JOB_ID in your shell:\n"
         "  export AUTOLEASE_JOB_ID=$(autolease run -- <command>)",
         file=sys.stderr,
     )
@@ -241,20 +258,24 @@ def cmd_run(args):
 def cmd_status(args):
     cfg = load_config(args.config)
     q = JobQueue(cfg)
-    job_id = _get_job_id(args, cfg)
-    # Read-only: refresh remote state (1 SSH) but don't dispatch
-    job = q.get(job_id, dispatch=False)
-    if job is None:
-        print(f"unknown", file=sys.stderr)
-        sys.exit(1)
-    if args.json:
-        from dataclasses import asdict
-        print(json.dumps(asdict(job)))
-    else:
-        if job.state == "done":
-            print(f"done:{job.exit_code}")
+    job_ids = _get_job_ids(args, cfg)
+    show_id = len(job_ids) > 1
+    for jid in job_ids:
+        # Read-only: refresh remote state (1 SSH) but don't dispatch
+        job = q.get(jid, dispatch=False)
+        if job is None:
+            line = "unknown"
+        elif args.json:
+            from dataclasses import asdict
+            line = json.dumps(asdict(job))
+        elif job.state == "done":
+            line = f"done:{job.exit_code}"
         else:
-            print(job.state)
+            line = job.state
+        if show_id:
+            print(f"{jid}\t{line}")
+        else:
+            print(line)
 
 
 def cmd_jobs(args):
@@ -353,12 +374,15 @@ def cmd_poll(args):
 def cmd_cancel(args):
     cfg = load_config(args.config)
     q = JobQueue(cfg)
-    job_id = _get_job_id(args, cfg)
-    ok = q.cancel(job_id)
-    if ok:
-        print(f"Cancelled job {job_id}.")
-    else:
-        print(f"Job {job_id} not found or already finished.", file=sys.stderr)
+    job_ids = _get_job_ids(args, cfg)
+    failures = 0
+    for jid in job_ids:
+        if q.cancel(jid):
+            print(f"Cancelled job {jid}.")
+        else:
+            print(f"Job {jid} not found or already finished.", file=sys.stderr)
+            failures += 1
+    if failures:
         sys.exit(1)
 
 
@@ -383,6 +407,119 @@ def cmd_redo(args):
     print(new_job.id)
     if args.poll:
         _do_poll(q, new_job.id)
+
+
+SHELL_INIT_BASH = """\
+# autolease shell helpers — eval $(autolease shell-init bash) in your rc file
+# Captures the job ID from `autolease run` into AUTOLEASE_JOB_ID for this shell.
+al-run() {
+    local id
+    id=$(autolease run "$@") || return $?
+    export AUTOLEASE_JOB_ID="$id"
+    echo "AUTOLEASE_JOB_ID=$id" >&2
+}
+al-redo() {
+    local id
+    id=$(autolease redo "$@") || return $?
+    export AUTOLEASE_JOB_ID="$id"
+    echo "AUTOLEASE_JOB_ID=$id" >&2
+}
+"""
+
+SHELL_INIT_ZSH = SHELL_INIT_BASH  # bash function syntax works in zsh
+
+SHELL_INIT_FISH = """\
+# autolease shell helpers — `autolease shell-init fish | source` in config.fish
+function al-run
+    set -l id (autolease run $argv)
+    or return $status
+    set -gx AUTOLEASE_JOB_ID $id
+    echo "AUTOLEASE_JOB_ID=$id" >&2
+end
+function al-redo
+    set -l id (autolease redo $argv)
+    or return $status
+    set -gx AUTOLEASE_JOB_ID $id
+    echo "AUTOLEASE_JOB_ID=$id" >&2
+end
+"""
+
+
+def cmd_shell_init(args):
+    """Print shell helper functions to stdout for sourcing."""
+    snippets = {
+        "bash": SHELL_INIT_BASH,
+        "zsh": SHELL_INIT_ZSH,
+        "fish": SHELL_INIT_FISH,
+    }
+    snippet = snippets.get(args.shell)
+    if snippet is None:
+        print(f"Unknown shell: {args.shell}. Supported: {', '.join(snippets)}",
+              file=sys.stderr)
+        sys.exit(1)
+    print(snippet, end="")
+
+
+def cmd_info(args):
+    """One-shot dump of everything autolease knows about a job:
+    state, lease, node, files, history, recent log."""
+    cfg = load_config(args.config)
+    q = JobQueue(cfg)
+    job_ids = _get_job_ids(args, cfg)
+    for jid in job_ids:
+        j = q._load_job(jid)
+        if j is None:
+            print(f"Job {jid}: not found", file=sys.stderr)
+            continue
+        print(f"━━━ job {j.id} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"  project    : {j.project}")
+        print(f"  command    : {j.command}")
+        print(f"  state      : {j.state}" + (f" (exit {j.exit_code})" if j.exit_code is not None else ""))
+        print(f"  num_gpus   : {j.num_gpus}" + (f"  min_vram: {j.min_vram}G" if j.min_vram else ""))
+        if j.gpu_type:
+            print(f"  gpu_type   : {j.gpu_type}")
+        print(f"  priority   : {j.priority}")
+        print(f"  lease      : {j.lease_job_id}")
+        print(f"  step_name  : {j.step_name}")
+        print(f"  node       : {j.node}")
+        print(f"  remote_pid : {j.remote_pid}")
+        print(f"  remote_cwd : {j.remote_cwd}")
+        print(f"  submitted  : {j.submitted}")
+        print(f"  started    : {j.started}")
+        print(f"  finished   : {j.finished}")
+        print()
+        # History
+        history = q._read_job_history(jid)
+        if history:
+            print(f"  history ({len(history)} events):")
+            for line in history:
+                print(f"    {line}")
+        else:
+            print(f"  history: (no events recorded — pre-history job)")
+        print()
+        # Files on remote
+        rdir = f"~/.autolease/jobs/{jid}"
+        print(f"  remote dir : {rdir}")
+        try:
+            r = q.slurm.cfg.run(
+                f"ls -la {rdir}/ 2>/dev/null | tail -n +2",
+                timeout=10,
+            )
+            for line in r.stdout.strip().splitlines():
+                print(f"    {line}")
+        except Exception as e:
+            print(f"    (ls failed: {e})")
+        print()
+        # Show last few lines of log
+        if not args.no_log:
+            tail_n = args.tail
+            print(f"  log tail ({tail_n} lines from combined):")
+            log = q.read_log(jid, stream="combined", tail=tail_n)
+            if not log:
+                log = q.read_log(jid, stream="stdout", tail=tail_n) or "(no output)"
+            for line in log.rstrip("\n").splitlines()[-tail_n:]:
+                print(f"    {line}")
+        print()
 
 
 def cmd_recover(args):
@@ -413,11 +550,13 @@ def cmd_recover(args):
             j.finished = None
             j.exit_code = None
             q._save_job(j)
+            q._log_job_history(j.id, "RECOVER", to="running")
             print(f"  job {j.id}: recovered (wrapper PID {j.remote_pid} still alive)")
         elif state == "done":
             j.state = "done"
             j.exit_code = code
             q._save_job(j)
+            q._log_job_history(j.id, "RECOVER", to="done", exit_code=code)
             print(f"  job {j.id}: actually done (exit {code})")
         elif state == "lost":
             print(f"  job {j.id}: confirmed lost (PID gone, no exit_code, output quiet)")
@@ -612,9 +751,9 @@ def main():
                        help="Auto-start polling after submit")
     run_p.add_argument("command", nargs=argparse.REMAINDER, help="Command to run")
 
-    status_p = sub.add_parser("status", help="Get job state (one word)")
-    status_p.add_argument("job_id", type=int, nargs="?", default=None,
-                          help="Job ID (default: AUTOLEASE_JOB_ID or last job)")
+    status_p = sub.add_parser("status", help="Get job state (one word per job)")
+    status_p.add_argument("job_ids", type=int, nargs="*",
+                          help="Job IDs (default: AUTOLEASE_JOB_ID)")
     status_p.add_argument("--json", action="store_true", help="Full JSON output")
 
     jobs_p = sub.add_parser("jobs", help="List jobs")
@@ -642,9 +781,9 @@ def main():
     poll_p.add_argument("-i", "--interval", type=float, default=None,
                         help="Refresh interval in seconds (default: config poll_interval)")
 
-    cancel_p = sub.add_parser("cancel", help="Cancel a queued or running job")
-    cancel_p.add_argument("job_id", type=int, nargs="?", default=None,
-                          help="Job ID (default: AUTOLEASE_JOB_ID or last job)")
+    cancel_p = sub.add_parser("cancel", help="Cancel queued or running jobs")
+    cancel_p.add_argument("job_ids", type=int, nargs="*",
+                          help="Job IDs (default: AUTOLEASE_JOB_ID)")
 
     redo_p = sub.add_parser("redo", help="Re-submit the same command as a previous job")
     redo_p.add_argument("job_id", type=int, nargs="?", default=None,
@@ -684,10 +823,24 @@ def main():
     sub.add_parser("ssh-reset",
                    help="Tear down stale SSH ControlMaster sockets (use after network blips)")
 
+    init_p = sub.add_parser("shell-init",
+                            help="Print shell helpers (al-run, al-redo) for sourcing")
+    init_p.add_argument("shell", choices=["bash", "zsh", "fish"],
+                        help="Target shell")
+
     recover_p = sub.add_parser("recover",
                                help="Re-check failed jobs to rescue ones whose wrapper is actually still alive")
     recover_p.add_argument("job_id", type=int, nargs="?", default=None,
                            help="Specific job (default: all failed jobs with no exit_code)")
+
+    info_p = sub.add_parser("info",
+                            help="One-shot dump of everything autolease knows about a job")
+    info_p.add_argument("job_ids", type=int, nargs="*",
+                        help="Job IDs (default: AUTOLEASE_JOB_ID)")
+    info_p.add_argument("-n", "--tail", type=int, default=20,
+                        help="Lines of log to show (default: 20)")
+    info_p.add_argument("--no-log", action="store_true",
+                        help="Skip the log tail")
 
     args = p.parse_args()
 
@@ -736,6 +889,8 @@ def main():
         "partitions": cmd_partitions,
         "ssh-reset": cmd_ssh_reset,
         "recover": cmd_recover,
+        "info": cmd_info,
+        "shell-init": cmd_shell_init,
     }
     cmds[args.cmd](args)
 
