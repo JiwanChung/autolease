@@ -1,5 +1,6 @@
 """Configuration management for autolease."""
 
+import json
 import os
 import yaml
 from dataclasses import dataclass, field
@@ -68,6 +69,13 @@ class PoolConfig:
     exclude_nodes: list[str] = field(default_factory=list)
     state_dir: str = ""
     qos_rules: dict[str, QoSRule] = field(default_factory=dict)
+    # Tunables (defaults match historical hardcoded values)
+    tui_refresh_interval: float = 30.0  # TUI background refresh, seconds
+    poll_interval: float = 10.0         # `autolease poll` cycle, seconds
+    poll_tail_lines: int = 30           # initial lines on each poll cycle
+    ssh_timeout: int = 10               # per-SSH-call timeout, seconds
+    mtime_threshold: int = 60           # output-file recency for liveness, seconds
+    discovery_cache_seconds: int = 300  # how long to cache scontrol/sinfo output
 
     def __post_init__(self):
         if not self.state_dir:
@@ -78,8 +86,54 @@ class PoolConfig:
         return os.path.expanduser(self.state_dir)
 
 
-def discover_partitions(slurm) -> None:
-    """Populate PARTITION_INFO from the live cluster via scontrol."""
+def _discovery_cache_path() -> Path:
+    return _data_dir() / "discovery.cache.json"
+
+
+def _load_discovery_cache(max_age_seconds: int) -> Optional[dict]:
+    """Read PARTITION_INFO from cache if fresh enough."""
+    p = _discovery_cache_path()
+    if not p.exists():
+        return None
+    try:
+        import time as _time
+        age = _time.time() - p.stat().st_mtime
+        if age > max_age_seconds:
+            return None
+        with open(p) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_discovery_cache(partitions: dict) -> None:
+    """Persist PARTITION_INFO so subsequent CLI invocations skip the
+    scontrol/sinfo round-trips."""
+    p = _discovery_cache_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        tmp = str(p) + ".tmp"
+        # Convert tuple values to lists for JSON serialization
+        data = {name: [list(qos), gpu] for name, (qos, gpu) in partitions.items()}
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
+def discover_partitions(slurm, max_age_seconds: int = 300, force: bool = False) -> None:
+    """Populate PARTITION_INFO from the live cluster via scontrol.
+    Caches the result for `max_age_seconds` to avoid hammering the cluster
+    on every CLI invocation. Pass force=True to skip the cache."""
+    if not force:
+        cached = _load_discovery_cache(max_age_seconds)
+        if cached is not None:
+            PARTITION_INFO.clear()
+            for name, (qos, gpu) in cached.items():
+                PARTITION_INFO[name] = (list(qos), gpu)
+            return
+
     from .slurm import Slurm
     try:
         r = slurm.cfg.run(
@@ -144,6 +198,9 @@ def discover_partitions(slurm) -> None:
             qos_list = [q.strip() for q in allow_qos.split(",") if q.strip()]
         PARTITION_INFO[name] = (qos_list, gpu)
 
+    # Persist for subsequent invocations
+    _save_discovery_cache(PARTITION_INFO)
+
 
 def apply_qos_config(cfg: PoolConfig) -> None:
     """Apply QoS limits from config to the module-level dict."""
@@ -197,6 +254,8 @@ def load_config(path: Optional[str] = None) -> PoolConfig:
             else:
                 qos_rules[name] = QoSRule(name=name, gpu_limit=int(rule))
 
+        # Tunables block (all optional, defaults from PoolConfig)
+        tun = raw.get("tunables", {}) or {}
         cfg = PoolConfig(
             ssh_host=raw.get("ssh_host", "localhost"),
             shell=raw.get("shell", "bash"),
@@ -205,6 +264,12 @@ def load_config(path: Optional[str] = None) -> PoolConfig:
             exclude_nodes=raw.get("exclude_nodes", []),
             state_dir=raw.get("state_dir", str(_data_dir())),
             qos_rules=qos_rules,
+            tui_refresh_interval=float(tun.get("tui_refresh_interval", 30.0)),
+            poll_interval=float(tun.get("poll_interval", 10.0)),
+            poll_tail_lines=int(tun.get("poll_tail_lines", 30)),
+            ssh_timeout=int(tun.get("ssh_timeout", 10)),
+            mtime_threshold=int(tun.get("mtime_threshold", 60)),
+            discovery_cache_seconds=int(tun.get("discovery_cache_seconds", 300)),
         )
 
     # Environment variable overrides (take precedence over config file)

@@ -368,7 +368,9 @@ class AutoleaseApp(App):
 
     def on_mount(self) -> None:
         self._do_refresh()
-        self._refresh_timer = self.set_interval(30.0, self._do_refresh)
+        self._refresh_timer = self.set_interval(
+            self._config.tui_refresh_interval, self._do_refresh
+        )
 
     def _selected_job_id(self) -> int | None:
         """Get the currently selected job ID from the jobs table."""
@@ -401,7 +403,10 @@ class AutoleaseApp(App):
             if self._shutting_down:
                 return
             if not self._discovered:
-                discover_partitions(self._pool.slurm)
+                discover_partitions(
+                    self._pool.slurm,
+                    max_age_seconds=self._config.discovery_cache_seconds,
+                )
                 self._discovered = True
             if self._shutting_down:
                 return

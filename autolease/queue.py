@@ -15,6 +15,9 @@ from .config import PoolConfig, GPU_VRAM
 from .sync import sync as rsync_project, get_remote_dir
 
 
+JOB_SCHEMA_VERSION = 2  # bump on every dataclass change
+
+
 @dataclass
 class Job:
     id: int
@@ -37,6 +40,21 @@ class Job:
     submitted: Optional[str] = None
     started: Optional[str] = None
     finished: Optional[str] = None
+    schema_version: int = JOB_SCHEMA_VERSION
+
+
+def _migrate_job_dict(d: dict) -> dict:
+    """Bring an on-disk job JSON dict up to the current schema.
+    Cheap and idempotent — just sets defaults for missing fields. Bump
+    JOB_SCHEMA_VERSION when adding a field that needs a non-default migration."""
+    v = d.get("schema_version", 0)
+    if v < 1:
+        d.setdefault("priority", 0)
+        d.setdefault("remote_cwd", None)
+    if v < 2:
+        d.setdefault("step_name", None)
+    d["schema_version"] = JOB_SCHEMA_VERSION
+    return d
 
 
 def _now() -> str:
@@ -101,10 +119,7 @@ class JobQueue:
             return None
         with open(p) as f:
             d = json.load(f)
-        d.setdefault("priority", 0)
-        d.setdefault("remote_cwd", None)
-        d.setdefault("step_name", None)
-        return Job(**d)
+        return Job(**_migrate_job_dict(d))
 
     def _all_jobs(self) -> list[Job]:
         self._ensure_dirs()
@@ -114,10 +129,7 @@ class JobQueue:
                 try:
                     with open(os.path.join(self._jobs_dir, fname)) as f:
                         d = json.load(f)
-                    d.setdefault("priority", 0)
-                    d.setdefault("remote_cwd", None)
-                    d.setdefault("step_name", None)
-                    jobs.append(Job(**d))
+                    jobs.append(Job(**_migrate_job_dict(d)))
                 except (json.JSONDecodeError, TypeError):
                     continue
         jobs.sort(key=lambda j: j.id)
@@ -262,7 +274,7 @@ class JobQueue:
                     mtime = 0
                 if mtime > 0:
                     import time as _time
-                    if _time.time() - mtime < 60:
+                    if _time.time() - mtime < self.config.mtime_threshold:
                         return "running", None
                 return "lost", None
         return "unknown", None
@@ -308,7 +320,7 @@ class JobQueue:
                     mtime = 0
                 if mtime > 0:
                     import time as _time
-                    if _time.time() - mtime < 60:
+                    if _time.time() - mtime < self.config.mtime_threshold:
                         return "running", None
                 return "lost", None
         return "unknown", None

@@ -345,7 +345,9 @@ def cmd_poll(args):
     cfg = load_config(args.config)
     q = JobQueue(cfg)
     job_id = _get_job_id(args, cfg)
-    _do_poll(q, job_id, interval=args.interval)
+    interval = args.interval if args.interval is not None else cfg.poll_interval
+    tail_n = args.tail if args.tail is not None else cfg.poll_tail_lines
+    _do_poll(q, job_id, interval=interval, tail_n=tail_n)
 
 
 def cmd_cancel(args):
@@ -634,11 +636,11 @@ def main():
 
     poll_p = sub.add_parser("poll", help="Tail stdout+stderr of a job, refreshing periodically")
     poll_p.add_argument("job_id", type=int, nargs="?", default=None,
-                        help="Job ID (default: AUTOLEASE_JOB_ID or last job)")
-    poll_p.add_argument("-n", "--tail", type=int, default=50,
-                        help="Initial lines to show (default: 50)")
-    poll_p.add_argument("-i", "--interval", type=float, default=2.0,
-                        help="Refresh interval in seconds (default: 2)")
+                        help="Job ID (default: AUTOLEASE_JOB_ID)")
+    poll_p.add_argument("-n", "--tail", type=int, default=None,
+                        help="Initial lines to show (default: config poll_tail_lines)")
+    poll_p.add_argument("-i", "--interval", type=float, default=None,
+                        help="Refresh interval in seconds (default: config poll_interval)")
 
     cancel_p = sub.add_parser("cancel", help="Cancel a queued or running job")
     cancel_p.add_argument("job_id", type=int, nargs="?", default=None,
@@ -676,7 +678,9 @@ def main():
     events_p.add_argument("-n", "--tail", type=int, default=20,
                           help="Show last N events (default: 20)")
     sub.add_parser("nodes", help="Show cluster GPU nodes")
-    sub.add_parser("partitions", help="Show partition/QoS map")
+    parts_p = sub.add_parser("partitions", help="Show partition/QoS map")
+    parts_p.add_argument("--refresh", action="store_true",
+                         help="Bypass discovery cache (force a fresh scontrol/sinfo round-trip)")
     sub.add_parser("ssh-reset",
                    help="Tear down stale SSH ControlMaster sockets (use after network blips)")
 
@@ -700,7 +704,12 @@ def main():
     needs_discovery = {"up", "partitions", "nodes", "pool", "check", "test", "run", "redo"}
     if args.cmd in needs_discovery:
         from .slurm import Slurm, SlurmConfig
-        discover_partitions(Slurm(SlurmConfig(ssh_host=cfg.ssh_host, shell=cfg.shell)))
+        force = (args.cmd == "partitions" and getattr(args, "refresh", False))
+        discover_partitions(
+            Slurm(SlurmConfig(ssh_host=cfg.ssh_host, shell=cfg.shell)),
+            max_age_seconds=cfg.discovery_cache_seconds,
+            force=force,
+        )
 
     cmds = {
         "up": cmd_up,
