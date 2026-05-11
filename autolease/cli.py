@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import shlex
 import sys
 import time
 
@@ -334,36 +335,57 @@ def cmd_wait(args):
 
 
 def _do_poll(q: JobQueue, job_id: int, interval: float = 10.0, tail_n: int = 30):
-    """Polling loop: tail combined stdout+stderr (interleaved chronologically),
-    falling back to stdout for jobs launched before the combined-file change.
-    Two SSH calls per cycle: one to tail the log, one to refresh remote state
-    so we can detect when the job completes (without this, poll polls the
-    log forever even after the job has finished, because no other command
-    is updating the local JSON state)."""
+    """Polling loop: tail combined stdout+stderr + check for exit_code file
+    in a SINGLE SSH call per cycle. Exits when exit_code appears (job done)."""
+    rdir = f"~/.autolease/jobs/{job_id}"
+    # Combined command:
+    #   tail of combined file + separator + exit_code file (if present)
+    # Falls back to stdout file if combined doesn't exist (old jobs).
+    inner = (
+        f"if [ -e {rdir}/combined ]; then "
+        f"  tail -n {tail_n} {rdir}/combined 2>/dev/null; "
+        f"else "
+        f"  tail -n {tail_n} {rdir}/stdout 2>/dev/null; "
+        f"fi; "
+        f"echo __AL_POLL_SEP__; "
+        f"cat {rdir}/exit_code 2>/dev/null"
+    )
+    cmd = f"/bin/sh -c {shlex.quote(inner)}"
     try:
         while True:
-            out = q.read_log(job_id, stream="combined", tail=tail_n) or ""
-            if not out:
-                # Old jobs (no combined file) — fall back to stdout
-                out = q.read_log(job_id, stream="stdout", tail=tail_n) or ""
-
-            # Refresh job state from remote (1 SSH). Without this, the local
-            # JSON state stays "running" and we never exit.
-            job = q._load_job(job_id)
-            if job and job.state == "running":
-                q._refresh_running(job)
-                job = q._load_job(job_id)
+            r = q.slurm.cfg.run(cmd, timeout=15)
+            text = r.stdout
+            sep_idx = text.rfind("__AL_POLL_SEP__")
+            if sep_idx >= 0:
+                log_part = text[:sep_idx].rstrip("\n")
+                exit_part = text[sep_idx + len("__AL_POLL_SEP__"):].strip()
+            else:
+                log_part = text
+                exit_part = ""
 
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
-            if out:
-                print(out, end="", flush=True)
+            if log_part:
+                print(log_part, flush=True)
 
-            if job and job.state in ("done", "failed"):
-                exit_str = f"exit {job.exit_code}" if job.exit_code is not None else "exit ?"
-                print(f"\n--- job {job_id} {job.state} ({exit_str}) ---",
+            if exit_part:
+                # exit_code file exists → job done. Update local state
+                # so future commands see the right thing.
+                try:
+                    exit_code = int(exit_part)
+                except ValueError:
+                    exit_code = None
+                job = q._load_job(job_id)
+                if job and job.state == "running":
+                    job.state = "done"
+                    job.exit_code = exit_code
+                    from autolease.queue import _now as _t
+                    job.finished = _t()
+                    q._save_job(job)
+                    q._log_job_history(job_id, "DONE", exit_code=exit_code)
+                print(f"\n--- job {job_id} done (exit {exit_code}) ---",
                       file=sys.stderr)
-                sys.exit(job.exit_code or 0)
+                sys.exit(exit_code or 0)
 
             time.sleep(interval)
     except KeyboardInterrupt:
