@@ -628,13 +628,21 @@ class JobQueue:
                     else:
                         del by_project[proj]
 
-        # Sort leases by VRAM ascending — fill small GPUs first
-        leases_by_vram = sorted(leases, key=lambda l: GPU_VRAM.get(l.gpu_type, 0))
+        # Sort leases best-fit ascending: prefer the smallest LEASE (in GPU
+        # count) that still satisfies the job, then the smallest VRAM. So a
+        # 1-GPU job lands on a 1-GPU lease before a 2-GPU lease; a 2-GPU job
+        # lands on a 2-GPU lease before a 4-GPU lease. Without this, big
+        # leases get fragmented (one lease slot occupied → entire lease
+        # marked busy by _lease_is_busy) and small jobs waste capacity.
+        leases_by_fit = sorted(
+            leases,
+            key=lambda l: (l.num_gpus, GPU_VRAM.get(l.gpu_type, 0)),
+        )
 
         for job in rr_queue:
             # Try free lease first
             launched = False
-            for lease in leases_by_vram:
+            for lease in leases_by_fit:
                 if not self._lease_matches(lease, job):
                     continue
                 if self._lease_is_busy(lease, running):
@@ -676,7 +684,7 @@ class JobQueue:
             # No free lease — try preemption
             # Find lowest-priority running job on a matching lease
             candidates = []
-            for lease in leases_by_vram:
+            for lease in leases_by_fit:
                 if not self._lease_matches(lease, job):
                     continue
                 for rj in running:
