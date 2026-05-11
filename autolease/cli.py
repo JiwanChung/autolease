@@ -336,7 +336,10 @@ def cmd_wait(args):
 def _do_poll(q: JobQueue, job_id: int, interval: float = 10.0, tail_n: int = 30):
     """Polling loop: tail combined stdout+stderr (interleaved chronologically),
     falling back to stdout for jobs launched before the combined-file change.
-    Single SSH call per cycle."""
+    Two SSH calls per cycle: one to tail the log, one to refresh remote state
+    so we can detect when the job completes (without this, poll polls the
+    log forever even after the job has finished, because no other command
+    is updating the local JSON state)."""
     try:
         while True:
             out = q.read_log(job_id, stream="combined", tail=tail_n) or ""
@@ -344,12 +347,18 @@ def _do_poll(q: JobQueue, job_id: int, interval: float = 10.0, tail_n: int = 30)
                 # Old jobs (no combined file) — fall back to stdout
                 out = q.read_log(job_id, stream="stdout", tail=tail_n) or ""
 
+            # Refresh job state from remote (1 SSH). Without this, the local
+            # JSON state stays "running" and we never exit.
+            job = q._load_job(job_id)
+            if job and job.state == "running":
+                q._refresh_running(job)
+                job = q._load_job(job_id)
+
             sys.stdout.write("\033[2J\033[H")
             sys.stdout.flush()
             if out:
                 print(out, end="", flush=True)
 
-            job = q._load_job(job_id)
             if job and job.state in ("done", "failed"):
                 exit_str = f"exit {job.exit_code}" if job.exit_code is not None else "exit ?"
                 print(f"\n--- job {job_id} {job.state} ({exit_str}) ---",
