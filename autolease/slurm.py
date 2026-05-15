@@ -337,16 +337,21 @@ class Slurm:
 
     def submit_holder(self, partition: str, qos: str, num_gpus: int,
                       time: Optional[str] = None, exclude: str = "",
-                      job_name: str = "autolease") -> int:
-        """Submit a sleep job to hold GPUs. Returns job ID."""
+                      job_name: str = "autolease",
+                      cpus_per_task: int = 0) -> int:
+        """Submit a sleep job to hold an allocation. Returns job ID.
+        num_gpus == 0 acquires a CPU-only lease (no --gres=gpu)."""
         cmd = (
             f"sbatch --parsable"
             f" --partition={shlex.quote(partition)}"
             f" --qos={shlex.quote(qos)}"
-            f" --gres=gpu:{num_gpus}"
             f" --job-name={shlex.quote(job_name)}"
             f" --output=/dev/null --error=/dev/null"
         )
+        if num_gpus > 0:
+            cmd += f" --gres=gpu:{num_gpus}"
+        if cpus_per_task > 0:
+            cmd += f" --cpus-per-task={cpus_per_task}"
         if time:
             cmd += f" --time={shlex.quote(time)}"
         if exclude:
@@ -388,9 +393,13 @@ class Slurm:
 
     def run_on_lease(self, job_id: int, command: str, num_gpus: int = 1,
                      timeout: int = 600) -> subprocess.CompletedProcess:
-        """Run a command inside a held allocation via srun --jobid."""
+        """Run a command inside a held allocation via srun --jobid.
+        num_gpus == 0 runs without --gres (CPU-only step inside the lease)."""
         sh = self.cfg.shell
-        srun_prefix = f"srun --jobid={job_id} --gres=gpu:{num_gpus} --overlap"
+        if num_gpus > 0:
+            srun_prefix = f"srun --jobid={job_id} --gres=gpu:{num_gpus} --overlap"
+        else:
+            srun_prefix = f"srun --jobid={job_id} --overlap"
         # Pipe the user command through a heredoc to avoid quote-escaping hell
         # across SSH + shell layers.
         script = f"{srun_prefix} {sh} <<'__AUTOLEASE_EOF__'\n{command}\n__AUTOLEASE_EOF__"

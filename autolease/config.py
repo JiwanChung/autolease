@@ -47,11 +47,14 @@ class LeaseSpec:
     partition: str
     qos: str
     num_gpus: int = 1
+    cpus_per_task: int = 0  # only meaningful for CPU leases (num_gpus == 0)
     time: Optional[str] = None
     exclude: str = ""
 
     @property
     def gpu_type(self) -> str:
+        if self.num_gpus == 0:
+            return "cpu"
         info = PARTITION_INFO.get(self.partition)
         return info[1] if info else "unknown"
 

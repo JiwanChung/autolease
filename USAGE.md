@@ -95,6 +95,24 @@ id=$(autolease run -g a100 -- python train.py)
 
 If no matching lease is available, the job stays queued until one becomes free. Jobs without specific GPU requirements are dispatched to the smallest available GPU first, keeping large GPUs free for jobs that need them.
 
+### CPU-only jobs
+
+Pass `-n 0` to submit a CPU-only job. It runs as an `srun --overlap` step inside a lease without claiming any GPUs.
+
+```bash
+# CPU evaluation script — no GPU needed
+id=$(autolease run -n 0 -- python eval_metrics.py)
+```
+
+CPU jobs prefer CPU leases (acquired with `autolease up <partition> -n 0`) and fall back to piggybacking on a GPU lease if no CPU lease is free. A single lease can host one CPU job and one GPU job at the same time — they share the node but claim disjoint resources via `srun --overlap`.
+
+```bash
+# Hold a CPU-only allocation (no --gres, optional --cpus N)
+autolease up cpu_partition -n 0 --cpus 4
+```
+
+GPU jobs (default, `-n >= 1`) never land on CPU leases.
+
 ### Priority
 
 Jobs have a priority (default 0). Higher-priority jobs preempt lower-priority running jobs if no free lease is available. Preempted jobs are re-queued, not lost.
@@ -320,6 +338,30 @@ Example output:
 - If `status` shows `failed`, check `autolease log $id --stderr` for details.
 - If a lease was preempted, `autolease pool` will report it. Acquire a new one.
 - If a job was preempted by a higher-priority job, it goes back to `queued` and will re-dispatch when a slot opens.
+
+## Freeing leaked GPU memory
+
+Sometimes a job's child process survives after its `srun` step ends — typically a backgrounded subprocess or one that ignored SIGTERM — and keeps holding GPU memory. autolease treats the original job as `done`, but the GPU stays occupied. To find and clean those:
+
+```bash
+autolease gpu-procs              # inspect all leases (read-only)
+autolease gpu-procs -l 12345     # inspect a specific lease
+```
+
+Output annotates each GPU process as:
+- `live` — PID is in an active Slurm step (don't touch — could be your own work).
+- `orphan` — PID holds GPU memory but no Slurm step claims it. Safe to kill.
+- `unknown` — couldn't classify (e.g. `scontrol listpids` didn't run).
+
+Then:
+
+```bash
+autolease gpu-clean              # dry-run: prints what would be killed
+autolease gpu-clean --yes        # actually SIGTERM then SIGKILL the orphans
+autolease gpu-clean --yes --include-unknown   # also kill unknown PIDs
+```
+
+`gpu-clean` never touches PIDs labeled `live`. It SIGTERMs each target, waits 2s, then SIGKILLs stragglers, and reports which PIDs are still holding GPU memory after the round.
 
 ## Reference: exit codes
 

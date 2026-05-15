@@ -77,6 +77,281 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+# ── Modal: GPU procs inspector ──
+
+class GpuProcsScreen(ModalScreen[None]):
+    """Per-lease GPU process inspector. Empty until user presses 'r' to scan
+    (one `srun --overlap` + nvidia-smi on the compute node). 'k' kills
+    orphan PIDs after confirmation; 'live' PIDs are never offered."""
+
+    CSS = """
+    GpuProcsScreen {
+        align: center middle;
+    }
+    #gpu-dialog {
+        width: 110;
+        height: 32;
+        background: $surface;
+        border: round $primary;
+        padding: 1 2;
+    }
+    #gpu-title {
+        text-style: bold;
+        width: 100%;
+        content-align: center middle;
+        height: 1;
+        margin-bottom: 1;
+    }
+    #gpu-status {
+        height: auto;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #gpu-table {
+        height: 1fr;
+    }
+    #gpu-actions {
+        height: auto;
+        margin-top: 1;
+        align: right middle;
+    }
+    #gpu-actions Button {
+        margin-left: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close"),
+        Binding("r", "scan", "Scan"),
+        Binding("k", "kill", "Kill orphans"),
+        Binding("shift+k", "kill_selected", "Force-kill row"),
+        Binding("shift+x", "kill_all", "Kill ALL"),
+    ]
+
+    def __init__(self, lease, pool, queue):
+        super().__init__()
+        self._lease = lease
+        self._pool = pool
+        self._queue = queue  # JobQueue, used to compute stale_step_names
+        self._procs: list = []
+        self._busy = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gpu-dialog"):
+            title = (f"GPU procs — lease {self._lease.job_id} on "
+                     f"{self._lease.node} ({self._lease.gpu_type} "
+                     f"x{self._lease.num_gpus})")
+            yield Static(title, id="gpu-title")
+            yield Static(
+                "[b]r[/b] scan  [b]k[/b] kill orphans  "
+                "[b]K[/b] force-kill row  [b]X[/b] kill ALL  "
+                "[b]esc[/b] close",
+                id="gpu-status",
+            )
+            yield DataTable(id="gpu-table")
+            with Horizontal(id="gpu-actions"):
+                yield Button("Scan (r)", variant="primary", id="btn-scan")
+                yield Button("Kill orphans (k)", variant="error", id="btn-kill")
+                yield Button("Force-kill row (K)", variant="warning",
+                             id="btn-kill-row")
+                yield Button("Kill ALL (X)", variant="error", id="btn-kill-all")
+                yield Button("Close (esc)", variant="default", id="btn-close")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#gpu-table", DataTable)
+        table.add_columns("PID", "Status", "Step", "Step Name", "Mem MB", "Command")
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        # Auto-trigger first scan so the modal isn't empty on open.
+        # Subsequent scans require explicit `r`.
+        self.call_after_refresh(self.action_scan)
+
+    def _set_status(self, msg: str) -> None:
+        self.query_one("#gpu-status", Static).update(msg)
+
+    def action_scan(self) -> None:
+        if self._busy:
+            return
+        if self._lease.num_gpus == 0:
+            self._set_status("CPU-only lease — no GPU processes to inspect.")
+            return
+        self._busy = True
+        self._set_status("Scanning compute node (this can take a few seconds)...")
+        lease = self._lease
+        pool = self._pool
+        queue = self._queue
+        app = self.app
+
+        # Compute "stale" step names (autolease jobs marked done/failed)
+        # so the classifier can flag survivors of those steps as orphans.
+        stale: set[str] = set()
+        try:
+            for j in queue._all_jobs():
+                if j.state in ("done", "failed") and j.step_name:
+                    stale.add(j.step_name)
+        except Exception:
+            pass
+
+        def _work():
+            try:
+                procs, debug = pool.list_gpu_procs(
+                    lease, stale_step_names=stale,
+                )
+                err = None
+            except Exception as e:
+                procs, debug = [], ""
+                err = str(e)
+            app.call_from_thread(self._apply_scan, procs, debug, err)
+
+        app.run_worker(_work, thread=True, group="gpu-scan")
+
+    def _apply_scan(self, procs, debug, err) -> None:
+        self._busy = False
+        if err:
+            self._set_status(f"Scan failed: {err[:200]}")
+            return
+        self._procs = list(procs)
+        table = self.query_one("#gpu-table", DataTable)
+        table.clear()
+        if not procs:
+            msg = "No GPU processes found."
+            if debug:
+                msg += f"\n[dim]{debug}[/dim]"
+            self._set_status(msg)
+            return
+        n_live = sum(1 for p in procs if p.status == "live")
+        n_orphan = sum(1 for p in procs if p.status == "orphan")
+        n_unknown = sum(1 for p in procs if p.status == "unknown")
+        self._set_status(
+            f"{len(procs)} GPU process(es): "
+            f"[green]{n_live} live[/green], "
+            f"[red]{n_orphan} orphan[/red], "
+            f"[yellow]{n_unknown} unknown[/yellow]"
+        )
+        for p in procs:
+            cmd = p.cmdline[:60] if p.cmdline else "(unknown)"
+            step = p.step or "?"
+            step_name = (p.step_name or "")[:18]
+            table.add_row(str(p.pid), p.status, step, step_name,
+                          str(p.memory_mb), cmd)
+
+    def action_kill(self) -> None:
+        if self._busy:
+            return
+        orphans = [p for p in self._procs if p.status == "orphan"]
+        if not orphans:
+            self._set_status(
+                "No orphan processes to kill. "
+                "Press [b]r[/b] to scan, then check the status column."
+            )
+            return
+        msg = (f"Kill {len(orphans)} orphan PID(s) on lease "
+               f"{self._lease.job_id}? SIGTERM, wait 2s, then SIGKILL.")
+
+        def _confirmed(ok):
+            if ok:
+                self._do_kill([p.pid for p in orphans])
+
+        self.app.push_screen(ConfirmScreen(msg), _confirmed)
+
+    def _do_kill(self, pids: list) -> None:
+        self._busy = True
+        self._set_status(f"Killing {len(pids)} process(es)...")
+        lease = self._lease
+        pool = self._pool
+        app = self.app
+
+        def _work():
+            try:
+                result = pool.kill_gpu_procs(lease, pids)
+                err = None
+            except Exception as e:
+                result = {}
+                err = str(e)
+            app.call_from_thread(self._apply_kill, result, err)
+
+        app.run_worker(_work, thread=True, group="gpu-kill")
+
+    def _apply_kill(self, result, err) -> None:
+        self._busy = False
+        if err:
+            self._set_status(f"Kill failed: {err[:120]}")
+            return
+        freed = sum(1 for ok in result.values() if ok)
+        still = [pid for pid, ok in result.items() if not ok]
+        summary = f"Killed {freed}/{len(result)} process(es)."
+        if still:
+            summary += f" Still holding GPU: {still[:5]}"
+        self._set_status(summary + " Re-scanning...")
+        # Re-scan to show fresh state
+        self.action_scan()
+
+    def action_kill_all(self) -> None:
+        """Force-kill every PID currently in the table, regardless of
+        classification. The nuclear option — confirms with a strong message
+        because this can hit live work too."""
+        if self._busy or not self._procs:
+            self._set_status("Nothing to kill (run scan first?).")
+            return
+        n = len(self._procs)
+        n_live = sum(1 for p in self._procs if p.status == "live")
+        warn = ""
+        if n_live:
+            warn = f"\n[!] {n_live} of these are classified [b]live[/b]."
+        msg = (
+            f"Kill ALL {n} GPU process(es) on lease {self._lease.job_id}?"
+            f"{warn}\n"
+            f"SIGTERM, wait 2s, then SIGKILL.\n"
+            f"This is the nuclear option — proceed only if you're sure."
+        )
+        pids = [p.pid for p in self._procs]
+
+        def _confirmed(ok):
+            if ok:
+                self._do_kill(pids)
+
+        self.app.push_screen(ConfirmScreen(msg), _confirmed)
+
+    def action_kill_selected(self) -> None:
+        """Force-kill the PID in the currently-selected table row, regardless
+        of its classification. Use when the classifier missed an orphan."""
+        if self._busy or not self._procs:
+            return
+        table = self.query_one("#gpu-table", DataTable)
+        if table.cursor_row is None or table.cursor_row >= len(self._procs):
+            self._set_status("Select a row first (arrow keys), then press K.")
+            return
+        proc = self._procs[table.cursor_row]
+        msg = (
+            f"Force-kill PID {proc.pid} on lease {self._lease.job_id}?\n"
+            f"status={proc.status}  step={proc.step or '?'}"
+            + (f" ({proc.step_name})" if proc.step_name else "")
+            + f"\ncmd: {proc.cmdline[:80]}\n"
+            f"SIGTERM, wait 2s, then SIGKILL."
+        )
+
+        def _confirmed(ok):
+            if ok:
+                self._do_kill([proc.pid])
+
+        self.app.push_screen(ConfirmScreen(msg), _confirmed)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-scan":
+            self.action_scan()
+        elif event.button.id == "btn-kill":
+            self.action_kill()
+        elif event.button.id == "btn-kill-row":
+            self.action_kill_selected()
+        elif event.button.id == "btn-kill-all":
+            self.action_kill_all()
+        elif event.button.id == "btn-close":
+            self.dismiss(None)
+
+
 # ── Modal: Acquire Lease ──
 
 class AcquireLeaseScreen(ModalScreen[LeaseSpec | None]):
@@ -327,6 +602,7 @@ class AutoleaseApp(App):
         Binding("e", "toggle_log", "Log/Err"),
         Binding("c", "cancel", "Cancel"),
         Binding("shift+h", "health_check", "Check"),
+        Binding("g", "gpu_procs", "GPUs"),
         # vim-style navigation (not shown in footer)
         Binding("h", "focus_left", show=False),
         Binding("l", "focus_right", show=False),
@@ -736,6 +1012,41 @@ class AutoleaseApp(App):
         for worker in self.workers:
             worker.cancel()
         self.exit()
+
+    def action_gpu_procs(self) -> None:
+        """Open the GPU procs modal. Uses the lease selected in the leases
+        panel; if none, falls back to the first RUNNING GPU lease so `g`
+        always does something useful. The modal auto-runs the first scan
+        on open; further scans require explicit `r`."""
+        leases = self._pool._get_leases()
+        running = [l for l in leases if l.state == "RUNNING" and l.num_gpus > 0]
+        if not running:
+            self.notify("No running GPU leases to inspect", severity="warning")
+            return
+
+        job_id = self.query_one(PoolPanel).get_selected_job_id()
+        lease = None
+        if job_id is not None:
+            lease = next((l for l in leases if l.job_id == job_id), None)
+            if lease is None:
+                self.notify(f"Lease {job_id} not in local state",
+                            severity="warning")
+                return
+            if lease.state != "RUNNING":
+                self.notify(
+                    f"Lease {job_id} is {lease.state}; using first running",
+                    severity="warning")
+                lease = None
+            elif lease.num_gpus == 0:
+                self.notify(
+                    f"Lease {job_id} is CPU-only; using first GPU lease",
+                    severity="warning")
+                lease = None
+
+        if lease is None:
+            lease = running[0]
+
+        self.push_screen(GpuProcsScreen(lease, self._pool, self._queue))
 
     def action_health_check(self) -> None:
         def _do():

@@ -6,6 +6,7 @@ import os
 import shlex
 import sys
 import time
+from typing import Optional
 
 from .config import (
     load_config, LeaseSpec, PARTITION_INFO, GPU_VRAM, QOS_GPU_LIMITS,
@@ -35,10 +36,15 @@ def cmd_up(args):
         partition=args.partition,
         qos=qos,
         num_gpus=args.num_gpus,
+        cpus_per_task=args.cpus,
         time=args.time,
     )
     time_str = spec.time or "max"
-    print(f"Acquiring {spec.partition}/{spec.gpu_type} x{spec.num_gpus} ({time_str})...")
+    if spec.num_gpus == 0:
+        cpu_str = f" x{spec.cpus_per_task} cpus" if spec.cpus_per_task else ""
+        print(f"Acquiring {spec.partition}/cpu{cpu_str} ({time_str})...")
+    else:
+        print(f"Acquiring {spec.partition}/{spec.gpu_type} x{spec.num_gpus} ({time_str})...")
     try:
         lease = pool.up(spec)
     except RuntimeError as e:
@@ -180,6 +186,122 @@ def cmd_renew(args):
             print(f"  job {a['job_id']}: FAILED — {a['reason']}")
         elif a["action"] == "skip":
             print(f"  job {a['job_id']}: skipped — {a['reason']}")
+
+
+def _gather_gpu_procs(pool: "Pool", lease_filter: Optional[int]):
+    """Walk leases and collect GPU procs. Returns (rows, errors).
+    Each row is (lease, [GpuProc, ...], debug_msg)."""
+    leases = pool.status()
+    if lease_filter is not None:
+        leases = [l for l in leases if l.job_id == lease_filter]
+    # Build set of step names whose autolease job is done/failed — these
+    # are "stale" steps. Slurm sometimes hasn't reaped them yet but their
+    # GPU memory shouldn't be considered live work.
+    stale = _stale_step_names(pool)
+    rows = []
+    errors = []
+    for l in leases:
+        if l.state != "RUNNING":
+            errors.append((l, f"state={l.state}, skipped"))
+            continue
+        if l.num_gpus == 0:
+            errors.append((l, "cpu-only lease, skipped"))
+            continue
+        procs, debug = pool.list_gpu_procs(l, stale_step_names=stale)
+        rows.append((l, procs, debug))
+    return rows, errors
+
+
+def _stale_step_names(pool: "Pool") -> set[str]:
+    """Step names of autolease jobs in done / failed state — used to
+    cross-reference against Slurm's step list when classifying GPU procs."""
+    q = JobQueue(pool.config)
+    stale: set[str] = set()
+    for j in q._all_jobs():
+        if j.state in ("done", "failed") and j.step_name:
+            stale.add(j.step_name)
+    return stale
+
+
+def cmd_gpu_procs(args):
+    """List GPU-holding processes across leases, annotated with status."""
+    pool = Pool(load_config(args.config))
+    rows, errors = _gather_gpu_procs(pool, args.lease_id)
+    if not rows and not errors:
+        print("No active leases.")
+        return
+    for l, msg in errors:
+        print(f"lease {l.job_id} ({l.partition}): {msg}")
+    for l, procs, debug in rows:
+        header = f"lease {l.job_id} on {l.node} ({l.gpu_type} x{l.num_gpus}):"
+        if not procs:
+            print(f"{header} no GPU processes")
+            if debug:
+                print(f"  ({debug})")
+            continue
+        print(header)
+        print(f"  {'PID':>7}  {'STATUS':<8}  {'STEP':<12}  {'MEM_MB':>8}  CMD")
+        for p in procs:
+            cmd = p.cmdline[:50]
+            step_disp = (p.step or "?")
+            if p.step_name:
+                step_disp = f"{step_disp}({p.step_name[:10]})"
+            print(f"  {p.pid:>7}  {p.status:<8}  {step_disp:<12}  "
+                  f"{p.memory_mb:>8}  {cmd}")
+
+
+def cmd_gpu_clean(args):
+    """Kill orphan GPU-holding processes inside leases. Defaults to dry-run."""
+    pool = Pool(load_config(args.config))
+    rows, errors = _gather_gpu_procs(pool, args.lease_id)
+    if not rows and not errors:
+        print("No active leases.")
+        return
+    for l, msg in errors:
+        print(f"lease {l.job_id} ({l.partition}): {msg}")
+
+    killable_statuses = {"orphan"}
+    if args.include_unknown:
+        killable_statuses.add("unknown")
+    if args.all:
+        killable_statuses |= {"live", "unknown"}
+
+    total_targets = 0
+    plan: list[tuple] = []  # (lease, [pids])
+    for l, procs, debug in rows:
+        targets = [p for p in procs if p.status in killable_statuses]
+        if not targets:
+            msg = f"lease {l.job_id} on {l.node}: no orphan processes"
+            if debug and not procs:
+                msg += f" ({debug})"
+            print(msg)
+            continue
+        total_targets += len(targets)
+        print(f"lease {l.job_id} on {l.node}: {len(targets)} orphan(s)")
+        for p in targets:
+            print(f"  PID {p.pid}  status={p.status}  mem={p.memory_mb}MB  "
+                  f"cmd={p.cmdline[:60]}")
+        plan.append((l, [p.pid for p in targets]))
+
+    if total_targets == 0:
+        return
+    if not args.yes:
+        print()
+        print(f"Dry-run: {total_targets} process(es) would be killed. "
+              f"Re-run with --yes to actually kill.")
+        return
+
+    print()
+    print(f"Killing {total_targets} process(es) (SIGTERM, then SIGKILL)...")
+    for l, pids in plan:
+        result = pool.kill_gpu_procs(l, pids)
+        freed = sum(1 for ok in result.values() if ok)
+        still = [pid for pid, ok in result.items() if not ok]
+        print(f"  lease {l.job_id}: {freed}/{len(pids)} freed", end="")
+        if still:
+            print(f", still holding GPU: {still}")
+        else:
+            print()
 
 
 def cmd_bad_nodes(args):
@@ -648,12 +770,17 @@ def cmd_shell(args):
             sys.exit(1)
 
     shell = args.shell or cfg.shell
-    print(f"Opening {shell} on lease {lease.job_id} ({lease.node} / {lease.gpu_type} x{args.num_gpus})...",
-          file=sys.stderr)
-    srun = (
-        f"srun --jobid={lease.job_id} --gres=gpu:{args.num_gpus} --overlap"
-        f" --pty {shell}"
-    )
+    if args.num_gpus > 0:
+        print(f"Opening {shell} on lease {lease.job_id} ({lease.node} / {lease.gpu_type} x{args.num_gpus})...",
+              file=sys.stderr)
+        srun = (
+            f"srun --jobid={lease.job_id} --gres=gpu:{args.num_gpus} --overlap"
+            f" --pty {shell}"
+        )
+    else:
+        print(f"Opening {shell} on lease {lease.job_id} ({lease.node} / {lease.gpu_type}, cpu-only)...",
+              file=sys.stderr)
+        srun = f"srun --jobid={lease.job_id} --overlap --pty {shell}"
     if cfg.ssh_host:
         cmd = ["ssh", "-t", *pool.slurm.cfg.ssh_opts, cfg.ssh_host, srun]
     else:
@@ -741,7 +868,9 @@ def main():
     up_p.add_argument("-q", "--qos", default=None,
                       help="QoS (default: auto — base_qos if room, big_qos otherwise)")
     up_p.add_argument("-n", "--num-gpus", type=int, default=1,
-                      help="Number of GPUs (default: 1)")
+                      help="Number of GPUs (default: 1; pass 0 for a CPU-only lease)")
+    up_p.add_argument("--cpus", type=int, default=0,
+                      help="CPUs per task for CPU leases (default: Slurm default)")
     up_p.add_argument("-t", "--time", default=None,
                       help="Time limit (default: partition max)")
 
@@ -762,6 +891,29 @@ def main():
     bad_p.add_argument("--clear", action="store_true",
                        help="Clear dynamically detected bad nodes")
 
+    gpu_procs_p = sub.add_parser(
+        "gpu-procs",
+        help="List GPU-holding processes on leases (live / orphan / unknown)",
+    )
+    gpu_procs_p.add_argument("-l", "--lease-id", type=int, default=None,
+                             help="Only inspect this lease (default: all running)")
+
+    gpu_clean_p = sub.add_parser(
+        "gpu-clean",
+        help="Kill orphan GPU processes inside leases (dry-run by default)",
+    )
+    gpu_clean_p.add_argument("-l", "--lease-id", type=int, default=None,
+                             help="Only clean this lease (default: all running)")
+    gpu_clean_p.add_argument("--include-unknown", action="store_true",
+                             help="Also kill PIDs we couldn't classify "
+                                  "(e.g. scontrol listpids failed)")
+    gpu_clean_p.add_argument("--all", action="store_true",
+                             help="Nuclear option: kill EVERY GPU process on the lease, "
+                                  "even ones classified as live. Use when the "
+                                  "classifier is wrong.")
+    gpu_clean_p.add_argument("--yes", action="store_true",
+                             help="Actually kill (without this, prints plan only)")
+
     # Job queue
     run_p = sub.add_parser("run", help="Submit a job (async, prints job ID)")
     run_p.add_argument("-p", "--project", default=None,
@@ -769,7 +921,7 @@ def main():
     run_p.add_argument("-g", "--gpu-type", default=None,
                        help="Require exact GPU type (e.g. A6000)")
     run_p.add_argument("-n", "--num-gpus", type=int, default=1,
-                       help="Number of GPUs needed (default: 1)")
+                       help="Number of GPUs needed (default: 1; pass 0 for a CPU-only job)")
     run_p.add_argument("--min-vram", type=int, default=0,
                        help="Minimum VRAM per GPU in GB (e.g. 48)")
     run_p.add_argument("-P", "--priority", type=int, default=0,
@@ -836,7 +988,7 @@ def main():
     shell_p.add_argument("-g", "--gpu-type", default=None,
                          help="Match a lease with this GPU type")
     shell_p.add_argument("-n", "--num-gpus", type=int, default=1,
-                         help="GPUs to request from the lease (default: 1)")
+                         help="GPUs to request from the lease (default: 1; pass 0 for a CPU shell)")
     shell_p.add_argument("-s", "--shell", default=None,
                          help="Shell to run (default: config.shell)")
 
@@ -903,6 +1055,8 @@ def main():
         "test": cmd_test,
         "renew": cmd_renew,
         "bad-nodes": cmd_bad_nodes,
+        "gpu-procs": cmd_gpu_procs,
+        "gpu-clean": cmd_gpu_clean,
         "run": cmd_run,
         "status": cmd_status,
         "jobs": cmd_jobs,

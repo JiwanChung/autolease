@@ -185,10 +185,18 @@ class JobQueue:
         # processes can come and go (network blips, ControlMaster wedging,
         # login-node reboots) — Slurm always knows whether the step is alive
         # on the compute node.
-        srun = (
-            f"srun --jobid={lease.job_id} --gres=gpu:{job.num_gpus}"
-            f" --overlap --job-name={step_name}"
-        )
+        # num_gpus == 0 → CPU job, no --gres (runs as a CPU-only step inside
+        # whatever lease it landed on, GPU or CPU).
+        if job.num_gpus > 0:
+            srun = (
+                f"srun --jobid={lease.job_id} --gres=gpu:{job.num_gpus}"
+                f" --overlap --job-name={step_name}"
+            )
+        else:
+            srun = (
+                f"srun --jobid={lease.job_id}"
+                f" --overlap --job-name={step_name}"
+            )
 
         # Step 1: write run.sh (the user's command, on the compute node).
         cd_prefix = f"cd {job.remote_cwd} && " if job.remote_cwd else ""
@@ -538,11 +546,30 @@ class JobQueue:
     # ── Dispatcher ──
 
     def _lease_matches(self, lease: Lease, job: Job) -> bool:
-        """Check if a lease satisfies a job's GPU requirements."""
+        """Check if a lease can host this job.
+        CPU job (num_gpus == 0) accepts any RUNNING lease (CPU lease preferred,
+        GPU lease piggyback allowed). GPU job requires a GPU lease that fits
+        the count / type / vram constraints."""
         if lease.state != "RUNNING":
             return False
-        if job.gpu_type and lease.gpu_type.lower() != job.gpu_type.lower():
-            return False
+
+        job_is_cpu = job.num_gpus == 0
+        lease_is_cpu = lease.num_gpus == 0
+
+        if not job_is_cpu and lease_is_cpu:
+            return False  # GPU job can't run on a CPU lease
+
+        # If user pinned a gpu_type, honor it. A CPU lease can never satisfy
+        # an explicit gpu_type request.
+        if job.gpu_type:
+            if lease_is_cpu:
+                return False
+            if lease.gpu_type.lower() != job.gpu_type.lower():
+                return False
+
+        if job_is_cpu:
+            return True  # count / vram filters don't apply to CPU jobs
+
         if lease.num_gpus < job.num_gpus:
             return False
         if job.min_vram > 0:
@@ -551,9 +578,18 @@ class JobQueue:
                 return False
         return True
 
-    def _lease_is_busy(self, lease: Lease, running_jobs: list[Job]) -> bool:
-        """Check if a lease already has a job running on it."""
-        return any(j.lease_job_id == lease.job_id for j in running_jobs)
+    def _lease_is_busy(self, lease: Lease, running_jobs: list[Job],
+                       for_cpu_job: bool = False) -> bool:
+        """Lease can host at most one CPU job + at most one GPU job at a time.
+        CPU and GPU work coexist via --overlap (they claim disjoint resources).
+        for_cpu_job=True: busy iff another CPU job is on the lease.
+        for_cpu_job=False: busy iff another GPU job is on the lease."""
+        for j in running_jobs:
+            if j.lease_job_id != lease.job_id:
+                continue
+            if (j.num_gpus == 0) == for_cpu_job:
+                return True
+        return False
 
     def _preempt(self, victim: Job) -> None:
         """Kill a running job and re-queue it."""
@@ -634,18 +670,26 @@ class JobQueue:
         # lands on a 2-GPU lease before a 4-GPU lease. Without this, big
         # leases get fragmented (one lease slot occupied → entire lease
         # marked busy by _lease_is_busy) and small jobs waste capacity.
-        leases_by_fit = sorted(
-            leases,
-            key=lambda l: (l.num_gpus, GPU_VRAM.get(l.gpu_type, 0)),
-        )
+        # CPU jobs (num_gpus == 0) need a different order: CPU leases first
+        # (their natural home), then smallest GPU lease as piggyback overflow.
+        def _lease_order_for(job: Job):
+            if job.num_gpus == 0:
+                return lambda l: (
+                    0 if l.num_gpus == 0 else 1,
+                    l.num_gpus,
+                    GPU_VRAM.get(l.gpu_type, 0),
+                )
+            return lambda l: (l.num_gpus, GPU_VRAM.get(l.gpu_type, 0))
 
         for job in rr_queue:
+            is_cpu_job = job.num_gpus == 0
+            leases_by_fit = sorted(leases, key=_lease_order_for(job))
             # Try free lease first
             launched = False
             for lease in leases_by_fit:
                 if not self._lease_matches(lease, job):
                     continue
-                if self._lease_is_busy(lease, running):
+                if self._lease_is_busy(lease, running, for_cpu_job=is_cpu_job):
                     continue
                 result = self._launch_remote(job, lease)
                 if result:
@@ -682,13 +726,20 @@ class JobQueue:
                 continue
 
             # No free lease — try preemption
-            # Find lowest-priority running job on a matching lease
+            # Find lowest-priority running job on a matching lease.
+            # Only same-kind jobs are preemptable: a CPU job can preempt a
+            # CPU job; a GPU job preempts a GPU job. Cross-kind preemption
+            # would needlessly evict work that doesn't compete for resources.
             candidates = []
             for lease in leases_by_fit:
                 if not self._lease_matches(lease, job):
                     continue
                 for rj in running:
-                    if rj.lease_job_id == lease.job_id and rj.priority < job.priority:
+                    if rj.lease_job_id != lease.job_id:
+                        continue
+                    if (rj.num_gpus == 0) != is_cpu_job:
+                        continue
+                    if rj.priority < job.priority:
                         candidates.append((rj, lease))
 
             if not candidates:

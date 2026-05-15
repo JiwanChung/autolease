@@ -17,13 +17,15 @@ autolease solves this by maintaining a personal pool of held GPU allocations and
 
 ## How it works
 
-1. **Leases** are persistent `sbatch sleep` jobs that hold GPUs. You acquire them with `autolease up <partition>`.
+1. **Leases** are persistent `sbatch sleep` jobs that hold GPUs (or just CPUs — see below). You acquire them with `autolease up <partition>`.
 2. **Jobs** are async. `autolease run` syncs your code, wraps it in your conda env, dispatches to a lease, and returns a job ID.
 3. **Priority & preemption**: higher-priority jobs (`-P 10`) preempt lower-priority running jobs. Preempted jobs are re-queued, not killed. Jobs prefer the smallest GPU that fits.
 4. **Code sync**: code files are auto-rsynced to the cluster before each job. Remote path mirrors your local path relative to `~`.
 5. **Health checks** run `nvidia-smi` on each lease. Bad nodes are auto-excluded.
 6. **QoS auto-selection** fills guaranteed slots first, then overflows to preemptible.
 7. **Preemption detection** notifies you when a lease disappears unexpectedly.
+8. **CPU jobs / leases** (`-n 0`) skip `--gres=gpu`. CPU jobs prefer CPU leases but can piggyback on a GPU lease via `srun --overlap` (one CPU job + one GPU job per lease, no contention).
+9. **Stuck-GPU recovery**: `autolease gpu-procs` / `gpu-clean` (and the `g` modal in the TUI) find processes that survived their parent srun step and still hold GPU memory, and free them.
 
 ## Install
 
@@ -48,10 +50,12 @@ autolease
 # Or use the CLI:
 autolease up suma_rtx4090              # acquire 1 RTX4090, auto QoS, max time
 autolease up suma_a6000 -n 4           # acquire 4 A6000s
+autolease up cpu_partition -n 0 --cpus 4   # CPU-only lease (no --gres=gpu)
 autolease pool                         # see your leases
 
 # Submit work (auto-syncs code, activates env)
 export AUTOLEASE_JOB_ID=$(autolease run -- python train.py)
+export AUTOLEASE_JOB_ID=$(autolease run -n 0 -- python eval.py)   # CPU-only job
 
 # Per-shell job shortcuts (reads AUTOLEASE_JOB_ID):
 autolease poll                         # tail stdout, refreshing every 10s
@@ -67,6 +71,10 @@ autolease cancel 42
 
 # Submit and immediately start polling:
 autolease run --poll -- python train.py
+
+# Stuck GPU memory? Inspect / clean up
+autolease gpu-procs                    # show GPU procs per lease (live/orphan/unknown)
+autolease gpu-clean --yes              # SIGTERM/SIGKILL orphans only
 
 # Done for the day
 autolease down                         # release all leases
@@ -123,14 +131,16 @@ State and job data are stored in `~/.local/share/autolease/`. Per-job event hist
 
 | Command | Description |
 |---|---|
-| `autolease up <partition> [-n GPUs] [-t TIME] [-q QOS]` | Acquire a lease. QoS auto-selected if omitted. Time defaults to partition max. |
+| `autolease up <partition> [-n GPUs] [--cpus N] [-t TIME] [-q QOS]` | Acquire a lease. QoS auto-selected if omitted. Time defaults to partition max. `-n 0` acquires a CPU-only lease (no `--gres=gpu`); `--cpus N` sets `--cpus-per-task` for it. |
 | `autolease down` | Release all leases |
 | `autolease pool` | Show leases with remaining time, detect lost leases |
 | `autolease check [--replace]` | Quick health-check. `--replace` auto-swaps bad ones. |
 | `autolease test` | Thorough GPU test (nvidia-smi details + CUDA compute cap) |
 | `autolease renew [-t MINUTES]` | Renew leases within N minutes of expiry (default: 30) |
 | `autolease bad-nodes [--clear]` | Show or reset the bad-node list |
-| `autolease shell [lease_id] [-g TYPE] [-n GPUs] [-s SHELL]` | Open an interactive shell on a lease via `srun --pty` |
+| `autolease gpu-procs [-l LEASE_ID]` | List GPU-holding processes per lease, classified as `live` / `orphan` / `unknown` |
+| `autolease gpu-clean [-l LEASE_ID] [--include-unknown] [--all] [--yes]` | Kill orphan GPU processes. Defaults to dry-run; `--yes` actually kills. `--all` = nuclear (kill everything, even `live`). |
+| `autolease shell [lease_id] [-g TYPE] [-n GPUs] [-s SHELL]` | Open an interactive shell on a lease via `srun --pty`. `-n 0` for a CPU-only shell. |
 | `autolease ssh-reset` | Tear down stale SSH ControlMaster sockets (use after network blips or cluster reboots) |
 
 ### Job queue
@@ -154,7 +164,7 @@ Most job commands accept an optional job ID. If omitted, they read `AUTOLEASE_JO
 
 - `-p, --project` Project name (default: auto-detected from git root or cwd)
 - `-g, --gpu-type` Require exact GPU type (e.g. `A6000`)
-- `-n, --num-gpus` Number of GPUs (default: 1)
+- `-n, --num-gpus` Number of GPUs (default: 1; pass `0` for a CPU-only job)
 - `--min-vram` Minimum VRAM per GPU in GB (e.g. `48`)
 - `-P, --priority` Job priority (default: 0). Higher priority jobs preempt lower ones.
 - `-e, --env` Conda/micromamba env (overrides config default)
@@ -227,10 +237,23 @@ autolease info               # ditto
 | `e` | Toggle stdout/stderr of selected job |
 | `c` | Cancel selected lease or job depending on focus (with confirmation) |
 | `H` | Health-check all leases |
+| `g` | Open GPU procs modal for selected lease (auto-scans on open) |
 | `r` | Force refresh |
 | `q` | Quit |
 
 Selecting a job (arrow keys, j/k, or mouse) auto-loads its log in the output panel. Panel titles show aggregate stats (QoS usage, running job count, GPUs used).
+
+**GPU procs modal** (opened with `g`):
+
+| Key | Action |
+|---|---|
+| `r` | Re-scan compute node (one `srun --overlap` + `nvidia-smi` + `scontrol listpids`) |
+| `k` | Kill orphan PIDs (auto-classified — never touches `live`) |
+| `K` | Force-kill the selected row's PID, regardless of classification |
+| `X` | Kill ALL processes in the table (nuclear option, strong confirm) |
+| `esc` | Close |
+
+Classification: `live` = step is in `squeue -s` and not stale per autolease records, or PID is in the lease's `batch` step (sleep wrapper). `orphan` = step is gone from squeue, OR step name matches an autolease job marked done/failed, OR PID is in `extern` (adopted survivors), OR PID isn't in `scontrol listpids` (escaped its cgroup). `unknown` = lookup failed; never killed by `k`.
 
 ## QoS strategy
 
